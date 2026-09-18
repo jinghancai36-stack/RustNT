@@ -3,6 +3,7 @@ members = [
     "crates/rustnt-core",
     "crates/rustnt-cli",
     "crates/rustnt-bench",
+    "crates/rustnt-service",
 ]
 resolver = "2"
 
