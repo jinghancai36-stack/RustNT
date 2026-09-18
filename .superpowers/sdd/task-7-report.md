@@ -24,7 +24,12 @@ No Rust source files were changed.
 - [x] State that the bridge does not expose process control, arbitrary admin commands, or arbitrary script execution.
 - [x] Document the service lifecycle commands and status/identity behavior.
 - [x] Include the requested architecture flow and implementation boundaries.
-- [x] Keep Task04 and Task05 as separate future scopes, as required by the brief.
+- [x] Identify Task04 and Task05 as future product-scope labels and state that
+      the current work only establishes the service-bridge foundation.
+- [x] State that process control and administrator command execution are not
+      implemented and remain separately reviewed future scopes.
+- [x] Document the four-byte `ACK1` response acknowledgement on the same Pipe
+      connection, the 5-second wait, and its transport-level purpose.
 - [x] Add a reproducible benchmark checklist/template without invented measurements.
 - [x] Include Windows version, account, elevation, cold/warm state, and install state in the benchmark checklist.
 - [x] Remove trailing whitespace reported by `git diff --check` in `docs/benchmarks.md`.
@@ -50,6 +55,12 @@ PROCESS       N/A
 EXIT_CODE=0
 SERVICE_STATE=NOT_INSTALLED
 ```
+
+The protocol documentation now matches the implementation's response
+handshake: the client reads the response frame and sends `ACK1` on the same
+connection; the service waits up to 5 seconds for that confirmation, then
+abandons an unacknowledged connection and returns to its one-instance accept
+loop. `ACK1` is transport confirmation and is not an additional command.
 
 ## Concerns
 

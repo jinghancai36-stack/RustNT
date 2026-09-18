@@ -32,8 +32,13 @@
 - Service facts documented: LocalSystem account, demand start, local secured
   Pipe, explicit DACL, status transitions, token identity, and the fixed
   `PING`/`IDENTITY`/`CAPABILITIES` protocol allowlist.
-- Future scope boundary documented: process control remains Task 04; arbitrary
-  administrator command execution remains a separately reviewed Task 05
-  design with explicit authorization, auditing, and operation restrictions.
+- Task 04 and Task 05 are documented as future product-scope labels; the current
+  work only establishes the service-bridge foundation and does not implement
+  process control or administrator command execution.
+- Future privileged scopes remain separately reviewed designs with explicit
+  authorization, auditing, and operation restrictions.
+- Protocol transport detail documented: the client acknowledges each response
+  with `ACK1` on the same Pipe connection, and the service waits up to 5 seconds
+  before abandoning an unacknowledged connection.
 - Verification and privileged lifecycle results are recorded in
   `.superpowers/sdd/task-7-report.md`.
