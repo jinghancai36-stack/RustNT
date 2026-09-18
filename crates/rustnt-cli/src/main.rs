@@ -16,6 +16,16 @@ enum SortKey {
     Memory,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceCommand {
+    Install,
+    Uninstall,
+    Start,
+    Stop,
+    Status,
+    Identity,
+}
+
 struct Options {
     watch_seconds: Option<u64>,
     filter: Option<String>,
@@ -24,6 +34,10 @@ struct Options {
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("service") {
+        return run_service_cli(&args[1..]);
+    }
+
     if args.len() < 2 || args[0] != "process" || args[1] != "list" {
         print_usage();
         return ExitCode::from(2);
@@ -66,6 +80,178 @@ fn print_usage() {
         "usage: rustnt process list [--watch <seconds>] [--filter <text>] \
          [--sort <pid|name|cpu|memory>]"
     );
+}
+
+fn print_service_usage() {
+    eprintln!("usage: rustnt service <install|uninstall|start|stop|status|identity>");
+}
+
+fn run_service_cli(args: &[String]) -> ExitCode {
+    let command = match parse_service_command(args) {
+        Ok(command) => command,
+        Err(error) => {
+            eprintln!("usage error: {error}");
+            print_service_usage();
+            return ExitCode::from(2);
+        }
+    };
+
+    match run_service_command(command) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn parse_service_command(args: &[String]) -> Result<ServiceCommand, String> {
+    if args.len() != 1 {
+        return Err("service requires exactly one command".to_string());
+    }
+
+    match args[0].as_str() {
+        "install" => Ok(ServiceCommand::Install),
+        "uninstall" => Ok(ServiceCommand::Uninstall),
+        "start" => Ok(ServiceCommand::Start),
+        "stop" => Ok(ServiceCommand::Stop),
+        "status" => Ok(ServiceCommand::Status),
+        "identity" => Ok(ServiceCommand::Identity),
+        command => Err(format!("unknown service command: {command}")),
+    }
+}
+
+fn service_binary_path() -> Result<std::path::PathBuf, String> {
+    let current_exe =
+        env::current_exe().map_err(|error| format!("resolve current executable: {error}"))?;
+    let parent = current_exe
+        .parent()
+        .ok_or_else(|| "resolve current executable directory".to_string())?;
+    Ok(parent.join("rustnt-service.exe"))
+}
+
+fn run_service_command(command: ServiceCommand) -> Result<(), String> {
+    match command {
+        ServiceCommand::Install => {
+            let binary_path = service_binary_path()?;
+            rustnt_core::service::install_service(&binary_path).map_err(|error| error.to_string())
+        }
+        ServiceCommand::Uninstall => {
+            rustnt_core::service::uninstall_service().map_err(|error| error.to_string())
+        }
+        ServiceCommand::Start => {
+            rustnt_core::service::start_service().map_err(|error| error.to_string())
+        }
+        ServiceCommand::Stop => {
+            rustnt_core::service::stop_service().map_err(|error| error.to_string())
+        }
+        ServiceCommand::Status => {
+            let status =
+                rustnt_core::service::query_service_status().map_err(|error| error.to_string())?;
+            println!("{}", render_service_status(status));
+            Ok(())
+        }
+        ServiceCommand::Identity => run_identity_command(),
+    }
+}
+
+fn render_service_status(status: rustnt_core::service::ServiceStatus) -> String {
+    let state = match status.state {
+        rustnt_core::service::ServiceState::NotInstalled => "NOT_INSTALLED".to_string(),
+        rustnt_core::service::ServiceState::Stopped => "STOPPED".to_string(),
+        rustnt_core::service::ServiceState::StartPending => "START_PENDING".to_string(),
+        rustnt_core::service::ServiceState::Running => "RUNNING".to_string(),
+        rustnt_core::service::ServiceState::StopPending => "STOP_PENDING".to_string(),
+        rustnt_core::service::ServiceState::Other(value) => format!("OTHER({value})"),
+    };
+    let process = status
+        .process_id
+        .map(|process_id| process_id.to_string())
+        .unwrap_or_else(|| "N/A".to_string());
+
+    format!(
+        "RustNT Service\n\nSERVICE       RustNTControl\nSTATE         {state}\nPROCESS       {process}"
+    )
+}
+
+fn render_identity(identity: rustnt_core::service::ServiceIdentity) -> String {
+    format!(
+        "RustNT Service Identity\n\nSERVICE       {}\nACCOUNT       {}\nACCOUNT SID   {}\nINTEGRITY     {}\nELEVATED      {}\nPROTOCOL      {}\nCAPABILITIES  {}",
+        identity.service,
+        identity.account,
+        identity.account_sid,
+        identity.integrity,
+        identity.elevated,
+        identity.protocol_version,
+        identity.capabilities.join(",")
+    )
+}
+
+fn run_identity_command() -> Result<(), String> {
+    let status = rustnt_core::service::query_service_status().map_err(|error| error.to_string())?;
+    if matches!(
+        status.state,
+        rustnt_core::service::ServiceState::NotInstalled
+            | rustnt_core::service::ServiceState::Stopped
+    ) {
+        return Err("service is not running; run rustnt service start".to_string());
+    }
+
+    let response = rustnt_core::service::ServiceClient
+        .request(rustnt_core::service::Command::Identity)
+        .map_err(|error| error.to_string())?;
+    if response.status != 0 {
+        return Err(format!(
+            "service identity request failed with status {}",
+            response.status
+        ));
+    }
+
+    let identity = decode_identity(&response.payload)?;
+    println!("{}", render_identity(identity));
+    Ok(())
+}
+
+fn decode_identity(payload: &[u8]) -> Result<rustnt_core::service::ServiceIdentity, String> {
+    let payload = String::from_utf8(payload.to_vec())
+        .map_err(|error| format!("decode service identity payload: {error}"))?;
+    let mut fields = std::collections::HashMap::new();
+    for line in payload.lines() {
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| "decode service identity payload: malformed field".to_string())?;
+        if fields.insert(key, value).is_some() {
+            return Err(format!(
+                "decode service identity payload: duplicate field {key}"
+            ));
+        }
+    }
+
+    let field = |key: &str| {
+        fields
+            .get(key)
+            .copied()
+            .ok_or_else(|| format!("decode service identity payload: missing field {key}"))
+    };
+    let capabilities = field("CAPABILITIES")?
+        .split(',')
+        .filter(|capability| !capability.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    Ok(rustnt_core::service::ServiceIdentity {
+        service: field("SERVICE")?.to_string(),
+        account: field("ACCOUNT")?.to_string(),
+        account_sid: field("ACCOUNT_SID")?.to_string(),
+        integrity: field("INTEGRITY")?.to_string(),
+        elevated: field("ELEVATED")?.parse().map_err(|error| {
+            format!("decode service identity payload: invalid ELEVATED: {error}")
+        })?,
+        protocol_version: field("PROTOCOL")?.parse().map_err(|error| {
+            format!("decode service identity payload: invalid PROTOCOL: {error}")
+        })?,
+        capabilities,
+    })
 }
 
 fn parse_options(args: &[String]) -> Result<Options, String> {
@@ -277,8 +463,36 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_bytes, matches_filter, parse_options, render_processes, sort_processes, SortKey,
+        format_bytes, matches_filter, parse_options, parse_service_command, render_identity,
+        render_processes, sort_processes, ServiceCommand, SortKey,
     };
+
+    #[test]
+    fn parses_all_service_commands() {
+        assert_eq!(
+            parse_service_command(&strings(&["install"])).expect("install should parse"),
+            ServiceCommand::Install
+        );
+        assert_eq!(
+            parse_service_command(&strings(&["identity"])).expect("identity should parse"),
+            ServiceCommand::Identity
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_or_extra_service_arguments() {
+        assert!(parse_service_command(&strings(&["unknown"])).is_err());
+        assert!(parse_service_command(&strings(&["start", "extra"])).is_err());
+    }
+
+    #[test]
+    fn renders_identity_fields() {
+        let output = render_identity(sample_identity());
+        assert!(output.contains("ACCOUNT       LocalSystem"));
+        assert!(output.contains("INTEGRITY     System"));
+        assert!(output.contains("ELEVATED      true"));
+        assert!(output.contains("CAPABILITIES  ping,identity,capabilities"));
+    }
 
     #[test]
     fn formats_bytes_with_binary_units() {
@@ -341,6 +555,22 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    fn sample_identity() -> rustnt_core::service::ServiceIdentity {
+        rustnt_core::service::ServiceIdentity {
+            service: "RustNTControl".to_string(),
+            account: "LocalSystem".to_string(),
+            account_sid: "S-1-5-18".to_string(),
+            integrity: "System".to_string(),
+            elevated: true,
+            protocol_version: 1,
+            capabilities: vec![
+                "ping".to_string(),
+                "identity".to_string(),
+                "capabilities".to_string(),
+            ],
+        }
     }
 
     fn process(pid: u32, name: &str, path: Option<&str>) -> rustnt_core::ProcessInfo {
