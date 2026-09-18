@@ -9,6 +9,8 @@ use std::ptr;
 #[cfg(windows)]
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 #[cfg(windows)]
+use std::sync::{Condvar, Mutex};
+#[cfg(windows)]
 use std::thread;
 #[cfg(windows)]
 use std::time::{Duration, Instant};
@@ -1660,9 +1662,8 @@ pub(crate) fn run_pipe_server(stop_event: HANDLE) -> Result<(), ServiceError> {
 #[cfg(windows)]
 struct ServiceRuntime {
     status_handle: AtomicPtr<std::ffi::c_void>,
-    stop_event: AtomicPtr<std::ffi::c_void>,
     running: AtomicBool,
-    stop_event_owner: Option<OwnedHandle>,
+    callback_gate: CallbackGate,
 }
 
 #[cfg(windows)]
@@ -1670,15 +1671,119 @@ impl ServiceRuntime {
     fn new() -> Self {
         Self {
             status_handle: AtomicPtr::new(ptr::null_mut()),
-            stop_event: AtomicPtr::new(ptr::null_mut()),
             running: AtomicBool::new(false),
-            stop_event_owner: None,
+            callback_gate: CallbackGate::new(),
+        }
+    }
+}
+
+#[cfg(windows)]
+struct CallbackGate {
+    state: Mutex<CallbackState>,
+    drained: Condvar,
+}
+
+#[cfg(windows)]
+struct CallbackState {
+    accepting: bool,
+    active_callbacks: usize,
+    stop_event: Option<OwnedHandle>,
+}
+
+#[cfg(windows)]
+struct CallbackGuard<'a> {
+    gate: &'a CallbackGate,
+}
+
+#[cfg(windows)]
+impl CallbackGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(CallbackState {
+                accepting: true,
+                active_callbacks: 0,
+                stop_event: None,
+            }),
+            drained: Condvar::new(),
         }
     }
 
-    fn clear_stop_event(&mut self) {
-        self.stop_event.store(ptr::null_mut(), Ordering::Release);
-        self.stop_event_owner.take();
+    fn try_enter(&self) -> Option<CallbackGuard<'_>> {
+        let mut state = self.state.lock().expect("callback gate mutex poisoned");
+        if !state.accepting {
+            return None;
+        }
+        state.active_callbacks += 1;
+        Some(CallbackGuard { gate: self })
+    }
+
+    fn install_event(&self, event: OwnedHandle) -> HANDLE {
+        let handle = event.get();
+        let mut state = self.state.lock().expect("callback gate mutex poisoned");
+        state.stop_event = Some(event);
+        handle
+    }
+
+    fn stop_accepting(&self) {
+        let mut state = self.state.lock().expect("callback gate mutex poisoned");
+        state.accepting = false;
+    }
+
+    fn wait_for_drain(&self) {
+        let mut state = self.state.lock().expect("callback gate mutex poisoned");
+        while state.active_callbacks != 0 {
+            state = self
+                .drained
+                .wait(state)
+                .expect("callback gate mutex poisoned");
+        }
+    }
+
+    fn release_event(&self) {
+        let mut state = self.state.lock().expect("callback gate mutex poisoned");
+        drop(state.stop_event.take());
+    }
+
+    fn shutdown(&self) {
+        self.stop_accepting();
+        self.wait_for_drain();
+        self.release_event();
+    }
+
+    #[cfg(test)]
+    fn active_callbacks(&self) -> usize {
+        self.state
+            .lock()
+            .expect("callback gate mutex poisoned")
+            .active_callbacks
+    }
+}
+
+#[cfg(windows)]
+impl<'a> CallbackGuard<'a> {
+    fn stop_event(&self) -> Option<HANDLE> {
+        self.gate
+            .state
+            .lock()
+            .expect("callback gate mutex poisoned")
+            .stop_event
+            .as_ref()
+            .map(OwnedHandle::get)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for CallbackGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .expect("callback gate mutex poisoned");
+        state.active_callbacks -= 1;
+        if state.active_callbacks == 0 {
+            self.gate.drained.notify_all();
+        }
     }
 }
 
@@ -1742,13 +1847,15 @@ unsafe extern "system" fn service_control_handler(
     let context = &*context.cast::<ServiceRuntime>();
     match control {
         SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
+            let Some(callback) = context.callback_gate.try_enter() else {
+                return NO_ERROR;
+            };
             if !context.running.load(Ordering::Acquire) {
                 return NO_ERROR;
             }
-            let stop_event = context.stop_event.load(Ordering::Acquire);
-            if stop_event.is_null() {
+            let Some(stop_event) = callback.stop_event() else {
                 return ERROR_INVALID_HANDLE;
-            }
+            };
             if SetEvent(stop_event) == 0 {
                 GetLastError()
             } else {
@@ -1770,18 +1877,12 @@ fn run_service_main(context: &mut ServiceRuntime) -> Result<(), ServiceError> {
             return Err(error);
         }
     };
-    context.stop_event_owner = Some(stop_event);
-    let stop_event = context
-        .stop_event_owner
-        .as_ref()
-        .expect("service stop event was just installed")
-        .get();
-    context.stop_event.store(stop_event, Ordering::Release);
+    let stop_event = context.callback_gate.install_event(stop_event);
     context.running.store(true, Ordering::Release);
 
     if let Err(error) = report_service_status(context, SERVICE_RUNNING, None) {
         context.running.store(false, Ordering::Release);
-        context.clear_stop_event();
+        context.callback_gate.shutdown();
         let _ = report_service_status(context, SERVICE_STOPPED, Some(&error));
         return Err(error);
     }
@@ -1790,9 +1891,9 @@ fn run_service_main(context: &mut ServiceRuntime) -> Result<(), ServiceError> {
     context.running.store(false, Ordering::Release);
     let pending_result = report_service_status(context, SERVICE_STOP_PENDING, None);
 
-    // run_pipe_server owns each Pipe instance locally. Clearing the published event pointer
-    // before dropping its owner prevents the callback from observing a closed HANDLE.
-    context.clear_stop_event();
+    // Close callback admission, drain callbacks that may still be signaling the event, and
+    // drop the event owner while the same gate protects the callback's HANDLE lookup.
+    context.callback_gate.shutdown();
     let failure = pipe_result.as_ref().err().or(pending_result.as_ref().err());
     let stopped_result = report_service_status(context, SERVICE_STOPPED, failure);
 
@@ -1971,6 +2072,25 @@ mod tests {
     fn pipe_server_entrypoint_is_available_to_the_service_host() {
         let _ = super::run_pipe_server
             as fn(windows_sys::Win32::Foundation::HANDLE) -> Result<(), super::ServiceError>;
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn callback_gate_drains_before_event_release() {
+        let gate = super::CallbackGate::new();
+        let callback = gate
+            .try_enter()
+            .expect("callbacks should initially be accepted");
+
+        gate.stop_accepting();
+        assert!(
+            gate.try_enter().is_none(),
+            "new callbacks must be rejected during shutdown"
+        );
+
+        drop(callback);
+        gate.wait_for_drain();
+        assert_eq!(gate.active_callbacks(), 0);
     }
 
     #[cfg(windows)]
