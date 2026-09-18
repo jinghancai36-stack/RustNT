@@ -1,0 +1,12 @@
+[package]
+name = "rustnt-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rustnt"
+path = "src/main.rs"
+
+[dependencies]
+rustnt-core = { path = "../rustnt-core" }
