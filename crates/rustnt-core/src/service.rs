@@ -217,6 +217,18 @@ fn wide_null(value: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
 }
 
 #[cfg(windows)]
+fn format_service_binary_path(path: &Path) -> std::ffi::OsString {
+    if path.to_string_lossy().contains(' ') {
+        let mut formatted = std::ffi::OsString::from("\"");
+        formatted.push(path.as_os_str());
+        formatted.push("\"");
+        formatted
+    } else {
+        path.as_os_str().to_os_string()
+    }
+}
+
+#[cfg(windows)]
 fn service_name() -> Vec<u16> {
     wide_null(SERVICE_NAME)
 }
@@ -299,7 +311,7 @@ pub fn install_service(binary_path: &Path) -> Result<(), ServiceError> {
     let scm = open_scm(SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE)?;
     let name = service_name();
     let display_name = wide_null("RustNT Control Service");
-    let binary_path = wide_null(binary_path);
+    let binary_path = wide_null(format_service_binary_path(binary_path));
     let account = wide_null("LocalSystem");
     let handle = unsafe {
         // SAFETY: All strings are nul-terminated UTF-16 buffers valid for this call.
@@ -2124,6 +2136,23 @@ mod tests {
         assert_eq!(
             super::map_service_state(999),
             super::ServiceState::Other(999)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn service_binary_path_is_quoted_only_when_it_contains_spaces() {
+        use std::path::Path;
+
+        assert_eq!(
+            super::format_service_binary_path(Path::new(r"C:\RustNT\rustnt-service.exe",)),
+            r"C:\RustNT\rustnt-service.exe"
+        );
+        assert_eq!(
+            super::format_service_binary_path(Path::new(
+                r"C:\Program Files\RustNT\rustnt-service.exe",
+            )),
+            r#""C:\Program Files\RustNT\rustnt-service.exe""#
         );
     }
 

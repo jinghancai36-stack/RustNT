@@ -82,3 +82,42 @@ Result: exit code 0.
 - The focused `service` filter selects two parser tests; the identity renderer
   is covered by the full CLI test run because its required test name is
   `renders_identity_fields`.
+
+## Review / Fix Record
+
+Review finding: `install_service` passed an unquoted executable path directly
+to `CreateServiceW`. A path such as `C:\Program Files\RustNT\rustnt-service.exe`
+could therefore be parsed incorrectly by the service process launcher and
+created an unquoted service path risk.
+
+Fix: added the Windows-only `format_service_binary_path` helper in
+`crates/rustnt-core/src/service.rs`. It preserves paths without spaces and
+wraps paths containing spaces in one pair of double quotes before
+`CreateServiceW` receives the UTF-16 command line. Added a unit test covering
+both cases; the CLI Task06 routing and output were not changed.
+
+TDD evidence for the review fix:
+
+```text
+cargo test -p rustnt-core service_binary_path_is_quoted_only_when_it_contains_spaces
+```
+
+Initial result: expected RED compile failure because the helper did not exist.
+Final result: 1 passed, 0 failed.
+
+Post-fix verification:
+
+```text
+cargo test --workspace
+```
+
+Result: rustnt-cli 10 passed, rustnt-core 25 passed, all other test and
+doc-test targets completed with 0 failures.
+
+```text
+cargo fmt --all -- --check
+cargo clippy -p rustnt-cli --all-targets -- -D warnings
+git diff --check
+```
+
+Result: all three commands exited with code 0.
