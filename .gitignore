@@ -1,0 +1,14 @@
+/target/
+
+# Local editor and OS metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local environment and logs
+.env
+*.log
+
+# Rust backup files
+*.rs.bk
