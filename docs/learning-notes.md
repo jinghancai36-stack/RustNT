@@ -96,6 +96,14 @@ request:  magic[4] | version[u16] | command[u16] | payload_length[u32] | payload
 response: magic[4] | version[u16] | status[u32] | payload_length[u32] | payload
 ```
 
+After reading the complete response frame, the client writes the four-byte
+`ACK1` response acknowledgement on the same Pipe connection. The service waits
+up to 5 seconds for this acknowledgement. It uses this transport-level
+confirmation to know that the response was received before abandoning the
+connection; a timeout, disconnect, or incorrect acknowledgement causes the
+service to drop that connection and return to its one-instance accept loop.
+`ACK1` is not a fourth protocol command.
+
 The decoder rejects bad magic, unsupported versions, unknown commands,
 oversized payloads, and trailing or truncated bytes. Task 03 accepts only
 `PING`, `IDENTITY`, and `CAPABILITIES`, and these commands do not accept a
