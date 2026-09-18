@@ -111,6 +111,15 @@ Responses use:
 magic[4] | version[u16] | status[u32] | payload_length[u32] | payload
 ```
 
+After the client reads the complete response frame, it writes the four-byte
+`ACK1` response acknowledgement on the same Pipe connection. The service waits
+up to 5 seconds for this acknowledgement before it accepts the connection as
+complete. This confirms that the client received the response and prevents the
+service from treating an unacknowledged response as a completed exchange. A
+timeout, disconnect, or different four-byte message abandons the current
+connection and returns the server to its next one-instance accept loop. `ACK1`
+is a transport-level response confirmation, not a fourth protocol command.
+
 The decoder validates magic, protocol version, known command, exact frame
 length, and the 4096-byte payload limit. The only protocol commands are
 `PING`, `IDENTITY`, and `CAPABILITIES`. Requests for these Task 03 commands
@@ -133,10 +142,11 @@ free-form command dispatch. Each operation must be explicitly named,
 validated, authorized against the connecting token, and audited. Task 03 has
 no process-control or arbitrary administrator-command implementation.
 
-Process-control operations are reserved for Task 04. Administrator command
-execution is reserved for a separately reviewed Task 05 design with explicit
-authorization, auditing, and operation restrictions. These remain separate
-future scopes.
+Task 04 and Task 05 are future product-scope labels in the roadmap. The current
+Task 04/05 work only establishes this service-bridge foundation; it does not
+implement process control or administrator command execution. Those future
+scopes remain separate and require explicit authorization, auditing, and
+operation restrictions.
 
 All SCM, Pipe, event, and token HANDLE values are owned by local RAII wrappers
 in the core service module. Unsafe FFI blocks keep nearby safety comments for

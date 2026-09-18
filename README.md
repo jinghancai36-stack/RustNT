@@ -51,10 +51,11 @@ Task 03 exposes only the fixed protocol commands `PING`, `IDENTITY`, and
 service does not accept process-control requests, executable paths, arbitrary
 arguments, scripts, or administrator commands.
 
-Process-control operations are reserved for Task 04. Administrator command
-execution is reserved for a separately reviewed Task 05 design with explicit
-authorization, auditing, and operation restrictions. These are separate future
-scopes and are not implemented by this service bridge.
+Task 04 and Task 05 are future product-scope labels in the roadmap. The current
+Task 04/05 work only establishes this service-bridge foundation; it does not
+implement process control or administrator command execution. Any future
+process-control scope and separately reviewed administrator-command scope
+remain subject to explicit authorization, auditing, and operation restrictions.
 
 RustNT is a normal Windows user-mode project. It is not an operating system and
 does not replace the Windows kernel, drivers, or compatibility infrastructure.

@@ -125,7 +125,8 @@ identity response also includes protocol version and the fixed capability
 list. This is an observation of the service token, not a claim that every
 client is trusted.
 
-Process-control operations are reserved for Task 04. Administrator command
-execution is reserved for a separately reviewed Task 05 design with explicit
-authorization, auditing, and operation restrictions. Neither future scope is
-implemented here.
+Task 04 and Task 05 are future product-scope labels in the roadmap. The current
+Task 04/05 work only establishes the service-bridge foundation described here;
+neither process control nor administrator command execution is implemented.
+Those future scopes require explicit authorization, auditing, and operation
+restrictions and remain separate from this bridge.
