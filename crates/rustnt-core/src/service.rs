@@ -13,19 +13,33 @@ use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, ERROR_SERVICE_ALREADY_RUNNING,
-    ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_EXISTS, ERROR_SERVICE_NOT_ACTIVE, HANDLE,
+    CloseHandle, GetLastError, LocalFree, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_MORE_DATA,
+    ERROR_NOT_FOUND, ERROR_NO_DATA, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
+    ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_EXISTS,
+    ERROR_SERVICE_NOT_ACTIVE, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 #[cfg(windows)]
-use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+use windows_sys::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION,
+};
 #[cfg(windows)]
 use windows_sys::Win32::Security::{
     GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenElevation,
-    TokenIntegrityLevel, TokenUser, TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
-    TOKEN_USER,
+    TokenIntegrityLevel, TokenUser, SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL,
+    TOKEN_QUERY, TOKEN_USER,
 };
 #[cfg(windows)]
-use windows_sys::Win32::Storage::FileSystem::DELETE;
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FlushFileBuffers, ReadFile, WriteFile, DELETE, FILE_ATTRIBUTE_NORMAL,
+    FILE_FLAG_OVERLAPPED, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Pipes::{
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, SetNamedPipeHandleState,
+    WaitNamedPipeW, PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE,
+    PIPE_WAIT,
+};
 #[cfg(windows)]
 use windows_sys::Win32::System::Services::{
     CloseServiceHandle, ControlService, CreateServiceW, DeleteService, OpenSCManagerW,
@@ -37,7 +51,11 @@ use windows_sys::Win32::System::Services::{
     SERVICE_WIN32_OWN_PROCESS,
 };
 #[cfg(windows)]
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows_sys::Win32::System::Threading::{
+    CreateEventW, GetCurrentProcess, OpenProcessToken, WaitForMultipleObjects, INFINITE,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED, OVERLAPPED_0};
 
 pub const SERVICE_NAME: &str = "RustNTControl";
 pub const PIPE_NAME: &str = r"\\.\pipe\RustNT.Control.v1";
@@ -55,6 +73,15 @@ pub const STATUS_SUCCESS: u32 = 0;
 
 const REQUEST_MAGIC: &[u8; 4] = b"RNT1";
 const RESPONSE_MAGIC: &[u8; 4] = b"RNS1";
+#[cfg(windows)]
+const RESPONSE_ACK_MAGIC: &[u8; 4] = b"ACK1";
+const STATUS_ERROR: u32 = 1;
+#[cfg(windows)]
+const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
+#[cfg(windows)]
+const PIPE_BUFFER_SIZE: u32 = MAX_PAYLOAD as u32;
+#[cfg(windows)]
+const PIPE_TIMEOUT_MS: u32 = 5_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceError {
@@ -898,6 +925,732 @@ pub fn collect_identity() -> Result<ServiceIdentity, ServiceError> {
     ))
 }
 
+fn dispatch_command(command: Command) -> Response {
+    match command {
+        Command::Ping => Response {
+            status: STATUS_SUCCESS,
+            payload: Vec::new(),
+        },
+        Command::Identity => match collect_identity() {
+            Ok(identity) => Response {
+                status: STATUS_SUCCESS,
+                payload: identity_payload(&identity),
+            },
+            Err(error) => request_error_response(error),
+        },
+        Command::Capabilities => Response {
+            status: STATUS_SUCCESS,
+            payload: b"ping,identity,capabilities\n".to_vec(),
+        },
+    }
+}
+
+fn dispatch_request(request: Request) -> Response {
+    if request.payload.is_empty() {
+        dispatch_command(request.command)
+    } else {
+        request_error_response(ServiceError::protocol(
+            "dispatch request",
+            "Task 03 commands do not accept request payloads",
+        ))
+    }
+}
+
+fn request_error_response(error: ServiceError) -> Response {
+    let mut payload = error.to_string().into_bytes();
+    payload.truncate(MAX_PAYLOAD);
+    Response {
+        status: STATUS_ERROR,
+        payload,
+    }
+}
+
+pub struct ServiceClient;
+
+#[cfg(windows)]
+impl ServiceClient {
+    pub fn request(&self, command: Command) -> Result<Response, ServiceError> {
+        let name = wide_null(PIPE_NAME);
+        let deadline = Instant::now() + Duration::from_millis(PIPE_TIMEOUT_MS as u64);
+        let pipe = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.as_millis() == 0 {
+                return Err(ServiceError::protocol(
+                    "wait for RustNT service pipe",
+                    "timed out while opening the service pipe",
+                ));
+            }
+            let wait_ms = u32::try_from(remaining.as_millis())
+                .unwrap_or(u32::MAX)
+                .max(1);
+            let available = unsafe {
+                // SAFETY: name is a nul-terminated UTF-16 Pipe name valid for the duration
+                // of this bounded wait; the function retains no pointer after it returns.
+                WaitNamedPipeW(name.as_ptr(), wait_ms)
+            };
+            if available == 0 {
+                return Err(ServiceError::windows("wait for RustNT service pipe"));
+            }
+
+            let handle = unsafe {
+                // SAFETY: name is a nul-terminated UTF-16 Pipe name and all remaining
+                // pointer parameters are null where the API permits them.
+                CreateFileW(
+                    name.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    ptr::null_mut(),
+                )
+            };
+            if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+                break OwnedPipe::new(handle, "open RustNT service pipe")?;
+            }
+
+            let error = ServiceError::windows("open RustNT service pipe");
+            if error.code != Some(ERROR_PIPE_BUSY) {
+                return Err(error);
+            }
+        };
+
+        let mode = PIPE_READMODE_MESSAGE;
+        let mode_set = unsafe {
+            // SAFETY: pipe is an owned, open Named Pipe handle and mode points to a
+            // live message-read-mode value for the duration of this synchronous call.
+            SetNamedPipeHandleState(pipe.get(), &mode, ptr::null(), ptr::null())
+        };
+        if mode_set == 0 {
+            return Err(ServiceError::windows("set RustNT pipe read mode"));
+        }
+
+        let request = encode_request(&Request {
+            command,
+            payload: Vec::new(),
+        })?;
+        write_sync_pipe_message(pipe.get(), &request, "write RustNT pipe request")?;
+
+        let flushed = unsafe {
+            // SAFETY: pipe is an owned, open Pipe handle and no raw Rust pointer is
+            // retained by FlushFileBuffers after it returns.
+            FlushFileBuffers(pipe.get())
+        };
+        if flushed == 0 {
+            return Err(ServiceError::windows("flush RustNT pipe request"));
+        }
+
+        let mut response = vec![0u8; MAX_RESPONSE_FRAME_SIZE];
+        let response_size = read_sync_pipe_message(
+            pipe.get(),
+            &mut response,
+            "read RustNT pipe response",
+            MAX_RESPONSE_FRAME_SIZE,
+        )?;
+        let decoded = decode_response(&response[..response_size]);
+        write_sync_pipe_message(
+            pipe.get(),
+            RESPONSE_ACK_MAGIC,
+            "acknowledge RustNT response",
+        )?;
+        decoded
+    }
+}
+
+#[cfg(not(windows))]
+impl ServiceClient {
+    pub fn request(&self, _command: Command) -> Result<Response, ServiceError> {
+        Err(ServiceError::protocol(
+            "request RustNT service pipe",
+            "Windows is required",
+        ))
+    }
+}
+
+#[cfg(windows)]
+struct OwnedHandle(HANDLE);
+
+#[cfg(windows)]
+impl OwnedHandle {
+    fn new(handle: HANDLE, operation: &'static str) -> Result<Self, ServiceError> {
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            Err(ServiceError::windows(operation))
+        } else {
+            Ok(Self(handle))
+        }
+    }
+
+    fn get(&self) -> HANDLE {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+            unsafe {
+                // SAFETY: This wrapper uniquely owns a Win32 handle and closes it exactly
+                // once after all operations using it have completed.
+                CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+struct OwnedPipe {
+    handle: HANDLE,
+    connected: bool,
+}
+
+#[cfg(windows)]
+impl OwnedPipe {
+    fn new(handle: HANDLE, operation: &'static str) -> Result<Self, ServiceError> {
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            Err(ServiceError::windows(operation))
+        } else {
+            Ok(Self {
+                handle,
+                connected: false,
+            })
+        }
+    }
+
+    fn get(&self) -> HANDLE {
+        self.handle
+    }
+
+    fn mark_connected(&mut self) {
+        self.connected = true;
+    }
+}
+
+#[cfg(windows)]
+impl Drop for OwnedPipe {
+    fn drop(&mut self) {
+        if !self.handle.is_null() && self.handle != INVALID_HANDLE_VALUE {
+            if self.connected {
+                unsafe {
+                    // SAFETY: This server-side Pipe handle is still owned here; a single
+                    // connection is detached before the handle is closed.
+                    DisconnectNamedPipe(self.handle);
+                }
+            }
+            unsafe {
+                // SAFETY: This wrapper uniquely owns the Pipe handle and all pending I/O
+                // is completed or cancelled before the wrapper is dropped.
+                CloseHandle(self.handle);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn is_pipe_disconnect_code(code: Option<u32>) -> bool {
+    matches!(code, Some(ERROR_BROKEN_PIPE | ERROR_NO_DATA))
+}
+
+#[cfg(windows)]
+enum PipeIoError {
+    Stopped,
+    Disconnected,
+    TimedOut,
+    FrameTooLarge,
+    Operation(ServiceError),
+}
+
+#[cfg(windows)]
+fn create_pipe_instance() -> Result<OwnedPipe, ServiceError> {
+    let sddl = wide_null(PIPE_SDDL);
+    let mut descriptor = ptr::null_mut();
+    let descriptor_created = unsafe {
+        // SAFETY: sddl is a nul-terminated UTF-16 SDDL string and descriptor is writable
+        // storage for the LocalAlloc-owned descriptor returned by the API.
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION,
+            &mut descriptor,
+            ptr::null_mut(),
+        )
+    };
+    if descriptor_created == 0 {
+        return Err(ServiceError::windows(
+            "create RustNT pipe security descriptor",
+        ));
+    }
+    if descriptor.is_null() {
+        return Err(ServiceError::protocol(
+            "create RustNT pipe security descriptor",
+            "Windows API returned a null security descriptor",
+        ));
+    }
+    let descriptor = LocalAllocBuffer(descriptor);
+    let security_attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: 0,
+    };
+    let name = wide_null(PIPE_NAME);
+    let handle = unsafe {
+        // SAFETY: name is nul-terminated, security_attributes and its LocalAlloc-backed
+        // descriptor remain live for this call, and CreateNamedPipeW retains neither pointer.
+        CreateNamedPipeW(
+            name.as_ptr(),
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            1,
+            PIPE_BUFFER_SIZE,
+            PIPE_BUFFER_SIZE,
+            PIPE_TIMEOUT_MS,
+            &security_attributes,
+        )
+    };
+    OwnedPipe::new(handle, "create RustNT service pipe")
+}
+
+#[cfg(windows)]
+fn create_io_event(operation: &'static str) -> Result<OwnedHandle, ServiceError> {
+    let event = unsafe {
+        // SAFETY: Null attributes and name request a private manual-reset event; no pointer
+        // is retained after CreateEventW returns.
+        CreateEventW(ptr::null(), 1, 0, ptr::null())
+    };
+    OwnedHandle::new(event, operation)
+}
+
+#[cfg(windows)]
+fn new_overlapped(event: HANDLE) -> OVERLAPPED {
+    OVERLAPPED {
+        Internal: 0,
+        InternalHigh: 0,
+        Anonymous: OVERLAPPED_0 {
+            Pointer: ptr::null_mut(),
+        },
+        hEvent: event,
+    }
+}
+
+#[cfg(windows)]
+fn complete_overlapped(
+    handle: HANDLE,
+    overlapped: &OVERLAPPED,
+    operation: &'static str,
+) -> Result<u32, ServiceError> {
+    let mut transferred = 0;
+    let completed = unsafe {
+        // SAFETY: handle is an owned Pipe handle, overlapped and its event remain live
+        // until this wait completes, and transferred is writable result storage.
+        GetOverlappedResult(handle, overlapped, &mut transferred, 1)
+    };
+    if completed == 0 {
+        Err(ServiceError::windows(operation))
+    } else {
+        Ok(transferred)
+    }
+}
+
+#[cfg(windows)]
+enum OverlappedWait {
+    Completed(u32),
+    Stopped,
+    TimedOut,
+}
+
+#[cfg(windows)]
+fn cancel_and_complete_overlapped(
+    handle: HANDLE,
+    overlapped: &OVERLAPPED,
+    operation: &'static str,
+) -> Result<OverlappedWait, ServiceError> {
+    let cancel_error = unsafe {
+        // SAFETY: handle owns the pending operation referenced by overlapped, and both
+        // remain alive until GetOverlappedResult below has returned.
+        if CancelIoEx(handle, overlapped) == 0 {
+            let error = ServiceError::windows(operation);
+            (error.code != Some(ERROR_NOT_FOUND)).then_some(error)
+        } else {
+            None
+        }
+    };
+
+    let mut transferred = 0;
+    let completed = unsafe {
+        // SAFETY: cancellation has been requested, and handle/overlapped remain live until
+        // this blocking completion query returns; transferred is writable result storage.
+        GetOverlappedResult(handle, overlapped, &mut transferred, 1)
+    };
+    if completed != 0 {
+        if let Some(error) = cancel_error {
+            return Err(error);
+        }
+        return Ok(OverlappedWait::Completed(transferred));
+    }
+
+    let completion_error = ServiceError::windows(operation);
+    if completion_error.code == Some(ERROR_OPERATION_ABORTED) && cancel_error.is_none() {
+        return Ok(OverlappedWait::Stopped);
+    }
+    Err(cancel_error.unwrap_or(completion_error))
+}
+
+#[cfg(windows)]
+fn wait_overlapped_with_stop(
+    handle: HANDLE,
+    overlapped: &OVERLAPPED,
+    stop_event: HANDLE,
+    operation: &'static str,
+) -> Result<OverlappedWait, ServiceError> {
+    wait_overlapped_with_stop_timeout(handle, overlapped, stop_event, operation, INFINITE)
+}
+
+#[cfg(windows)]
+fn wait_overlapped_with_stop_timeout(
+    handle: HANDLE,
+    overlapped: &OVERLAPPED,
+    stop_event: HANDLE,
+    operation: &'static str,
+    timeout_ms: u32,
+) -> Result<OverlappedWait, ServiceError> {
+    let handles = [overlapped.hEvent, stop_event];
+    let wait_result = unsafe {
+        // SAFETY: both handles are valid for the duration of this wait; overlapped and its
+        // event remain live until the pending operation is completed or cancelled.
+        WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, timeout_ms)
+    };
+    if wait_result == WAIT_OBJECT_0 {
+        return complete_overlapped(handle, overlapped, operation).map(OverlappedWait::Completed);
+    }
+    if wait_result == WAIT_OBJECT_0 + 1 {
+        return match cancel_and_complete_overlapped(handle, overlapped, operation) {
+            Ok(_) => Ok(OverlappedWait::Stopped),
+            Err(error) => Err(error),
+        };
+    }
+    if wait_result == WAIT_TIMEOUT {
+        return match cancel_and_complete_overlapped(handle, overlapped, operation) {
+            Ok(_) => Ok(OverlappedWait::TimedOut),
+            Err(error) => Err(error),
+        };
+    }
+
+    let wait_error = if wait_result == WAIT_FAILED {
+        ServiceError::windows(operation)
+    } else {
+        ServiceError::protocol(operation, "unexpected wait result")
+    };
+    match cancel_and_complete_overlapped(handle, overlapped, operation) {
+        Ok(_) => Err(wait_error),
+        Err(cleanup_error) => Err(cleanup_error),
+    }
+}
+
+#[cfg(windows)]
+fn write_sync_pipe_message(
+    handle: HANDLE,
+    bytes: &[u8],
+    operation: &'static str,
+) -> Result<(), ServiceError> {
+    let length = u32::try_from(bytes.len())
+        .map_err(|_| ServiceError::protocol(operation, "message length exceeds u32"))?;
+    let mut written = 0;
+    let result = unsafe {
+        // SAFETY: handle is an open synchronous Pipe handle; bytes is readable for length
+        // bytes and written is writable result storage for the duration of this call.
+        WriteFile(
+            handle,
+            bytes.as_ptr(),
+            length,
+            &mut written,
+            ptr::null_mut(),
+        )
+    };
+    if result == 0 {
+        return Err(ServiceError::windows(operation));
+    }
+    if written != length {
+        return Err(ServiceError::protocol(
+            operation,
+            "Pipe write was incomplete",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_sync_pipe_message(
+    handle: HANDLE,
+    buffer: &mut [u8],
+    operation: &'static str,
+    frame_limit: usize,
+) -> Result<usize, ServiceError> {
+    let length = u32::try_from(buffer.len())
+        .map_err(|_| ServiceError::protocol(operation, "buffer length exceeds u32"))?;
+    let mut read = 0;
+    let result = unsafe {
+        // SAFETY: handle is an open synchronous Pipe handle; buffer is writable for length
+        // bytes and read is writable result storage for the duration of this call.
+        ReadFile(
+            handle,
+            buffer.as_mut_ptr(),
+            length,
+            &mut read,
+            ptr::null_mut(),
+        )
+    };
+    if result == 0 {
+        let error = ServiceError::windows(operation);
+        if error.code == Some(ERROR_MORE_DATA) {
+            return Err(ServiceError::protocol(
+                operation,
+                format!("Pipe frame exceeds {frame_limit} bytes"),
+            ));
+        }
+        return Err(error);
+    }
+    Ok(read as usize)
+}
+
+#[cfg(windows)]
+fn write_overlapped_pipe_message(
+    handle: HANDLE,
+    bytes: &[u8],
+    operation: &'static str,
+    stop_event: HANDLE,
+) -> Result<(), PipeIoError> {
+    let length = u32::try_from(bytes.len()).map_err(|_| {
+        PipeIoError::Operation(ServiceError::protocol(
+            operation,
+            "message length exceeds u32",
+        ))
+    })?;
+    let event = create_io_event(operation).map_err(PipeIoError::Operation)?;
+    let mut overlapped = new_overlapped(event.get());
+    let mut written = 0;
+    let result = unsafe {
+        // SAFETY: handle and event are owned and live through completion; bytes is readable
+        // for length bytes, and overlapped/written remain live until I/O has completed.
+        WriteFile(
+            handle,
+            bytes.as_ptr(),
+            length,
+            &mut written,
+            &mut overlapped,
+        )
+    };
+    let written = if result != 0 {
+        written
+    } else {
+        let error = ServiceError::windows(operation);
+        if is_pipe_disconnect_code(error.code) {
+            return Err(PipeIoError::Disconnected);
+        }
+        if error.code != Some(ERROR_IO_PENDING) {
+            return Err(PipeIoError::Operation(error));
+        }
+        match wait_overlapped_with_stop(handle, &overlapped, stop_event, operation).map_err(
+            |error| {
+                if is_pipe_disconnect_code(error.code) {
+                    PipeIoError::Disconnected
+                } else {
+                    PipeIoError::Operation(error)
+                }
+            },
+        )? {
+            OverlappedWait::Completed(written) => written,
+            OverlappedWait::Stopped => return Err(PipeIoError::Stopped),
+            OverlappedWait::TimedOut => return Err(PipeIoError::TimedOut),
+        }
+    };
+    if written != length {
+        return Err(PipeIoError::Operation(ServiceError::protocol(
+            operation,
+            "Pipe write was incomplete",
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_overlapped_pipe_message(
+    handle: HANDLE,
+    buffer: &mut [u8],
+    operation: &'static str,
+    stop_event: HANDLE,
+    timeout_ms: u32,
+) -> Result<usize, PipeIoError> {
+    let length = u32::try_from(buffer.len()).map_err(|_| {
+        PipeIoError::Operation(ServiceError::protocol(
+            operation,
+            "buffer length exceeds u32",
+        ))
+    })?;
+    let event = create_io_event(operation).map_err(PipeIoError::Operation)?;
+    let mut overlapped = new_overlapped(event.get());
+    let mut read = 0;
+    let result = unsafe {
+        // SAFETY: handle and event are owned and live through completion; buffer is writable
+        // for length bytes, and overlapped/read remain live until I/O has completed.
+        ReadFile(
+            handle,
+            buffer.as_mut_ptr(),
+            length,
+            &mut read,
+            &mut overlapped,
+        )
+    };
+    if result != 0 {
+        return Ok(read as usize);
+    }
+
+    let error = ServiceError::windows(operation);
+    if error.code == Some(ERROR_MORE_DATA) {
+        return Err(PipeIoError::FrameTooLarge);
+    }
+    if is_pipe_disconnect_code(error.code) {
+        return Err(PipeIoError::Disconnected);
+    }
+    if error.code != Some(ERROR_IO_PENDING) {
+        return Err(PipeIoError::Operation(error));
+    }
+
+    match wait_overlapped_with_stop_timeout(handle, &overlapped, stop_event, operation, timeout_ms)
+        .map_err(|error| {
+            if is_pipe_disconnect_code(error.code) {
+                PipeIoError::Disconnected
+            } else {
+                PipeIoError::Operation(error)
+            }
+        })? {
+        OverlappedWait::Stopped => Err(PipeIoError::Stopped),
+        OverlappedWait::TimedOut => Err(PipeIoError::TimedOut),
+        OverlappedWait::Completed(read) => Ok(read as usize),
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_pipe_connection(
+    pipe: &mut OwnedPipe,
+    stop_event: HANDLE,
+) -> Result<bool, ServiceError> {
+    if stop_event.is_null() || stop_event == INVALID_HANDLE_VALUE {
+        return Err(ServiceError::protocol(
+            "wait for RustNT pipe connection",
+            "service stop event is invalid",
+        ));
+    }
+
+    let event = create_io_event("create RustNT pipe connect event")?;
+    let mut overlapped = new_overlapped(event.get());
+    let connected = unsafe {
+        // SAFETY: pipe and event are owned and live through the wait; overlapped remains
+        // live until its pending connection is completed or cancelled.
+        ConnectNamedPipe(pipe.get(), &mut overlapped)
+    };
+    if connected != 0 {
+        pipe.mark_connected();
+        return Ok(true);
+    }
+
+    let error = ServiceError::windows("connect RustNT service pipe");
+    if error.code == Some(ERROR_PIPE_CONNECTED) {
+        pipe.mark_connected();
+        return Ok(true);
+    }
+    if error.code != Some(ERROR_IO_PENDING) {
+        return Err(error);
+    }
+
+    match wait_overlapped_with_stop(
+        pipe.get(),
+        &overlapped,
+        stop_event,
+        "wait for RustNT pipe connection",
+    )? {
+        OverlappedWait::Completed(_) => {
+            pipe.mark_connected();
+            Ok(true)
+        }
+        OverlappedWait::Stopped => Ok(false),
+        OverlappedWait::TimedOut => Ok(false),
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn run_pipe_server(stop_event: HANDLE) -> Result<(), ServiceError> {
+    loop {
+        let mut pipe = create_pipe_instance()?;
+        if !wait_for_pipe_connection(&mut pipe, stop_event)? {
+            return Ok(());
+        }
+
+        let mut request_buffer = vec![0u8; MAX_REQUEST_FRAME_SIZE];
+        let response = match read_overlapped_pipe_message(
+            pipe.get(),
+            &mut request_buffer,
+            "read RustNT pipe request",
+            stop_event,
+            INFINITE,
+        ) {
+            Ok(request_size) => match decode_request(&request_buffer[..request_size]) {
+                Ok(request) => dispatch_request(request),
+                Err(error) => request_error_response(error),
+            },
+            Err(PipeIoError::Stopped) => return Ok(()),
+            Err(PipeIoError::Disconnected) => continue,
+            Err(PipeIoError::TimedOut) => continue,
+            Err(PipeIoError::FrameTooLarge) => request_error_response(ServiceError::protocol(
+                "read RustNT pipe request",
+                format!("Pipe frame exceeds {MAX_REQUEST_FRAME_SIZE} bytes"),
+            )),
+            Err(PipeIoError::Operation(error)) => return Err(error),
+        };
+        let response = encode_response(&response)?;
+        match write_overlapped_pipe_message(
+            pipe.get(),
+            &response,
+            "write RustNT pipe response",
+            stop_event,
+        ) {
+            Ok(()) => {}
+            Err(PipeIoError::Stopped) => return Ok(()),
+            Err(PipeIoError::Disconnected) => continue,
+            Err(PipeIoError::TimedOut) => continue,
+            Err(PipeIoError::FrameTooLarge) => {
+                return Err(ServiceError::protocol(
+                    "write RustNT pipe response",
+                    "response unexpectedly exceeded the Pipe frame limit",
+                ));
+            }
+            Err(PipeIoError::Operation(error)) => return Err(error),
+        }
+
+        let mut acknowledgement = [0u8; RESPONSE_ACK_MAGIC.len()];
+        match read_overlapped_pipe_message(
+            pipe.get(),
+            &mut acknowledgement,
+            "read RustNT response acknowledgement",
+            stop_event,
+            PIPE_TIMEOUT_MS,
+        ) {
+            Ok(size) if acknowledgement[..size] == *RESPONSE_ACK_MAGIC => {}
+            Ok(_)
+            | Err(PipeIoError::Disconnected)
+            | Err(PipeIoError::TimedOut)
+            | Err(PipeIoError::FrameTooLarge) => {
+                continue;
+            }
+            Err(PipeIoError::Stopped) => return Ok(()),
+            Err(PipeIoError::Operation(error)) => return Err(error),
+        }
+    }
+}
+
+// Keep the Task 04 server call graph type-checked until Task 05's service host
+// becomes its runtime caller, without exposing a raw HANDLE outside this crate.
+#[cfg(windows)]
+const _: fn(HANDLE) -> Result<(), ServiceError> = run_pipe_server;
+
 #[cfg(test)]
 mod tests {
     use windows_sys::Win32::System::Services::{
@@ -907,7 +1660,7 @@ mod tests {
     use super::{
         decode_request, decode_response, encode_request, encode_response, Command, Request,
         Response, ServiceIdentity, MAX_PAYLOAD, MAX_RESPONSE_FRAME_SIZE, PROTOCOL_VERSION,
-        RESPONSE_HEADER_SIZE, SERVICE_NAME,
+        RESPONSE_HEADER_SIZE, SERVICE_NAME, STATUS_SUCCESS,
     };
 
     #[test]
@@ -953,6 +1706,46 @@ mod tests {
         identity.account = "LocalSystem".to_string();
         identity.capabilities = vec!["ping=forged".to_string()];
         assert!(super::identity_payload(&identity).is_empty());
+    }
+
+    #[test]
+    fn dispatch_allows_only_task_03_commands() {
+        assert_eq!(
+            super::dispatch_command(Command::Ping),
+            Response {
+                status: STATUS_SUCCESS,
+                payload: Vec::new(),
+            }
+        );
+        assert!(super::dispatch_command(Command::Identity)
+            .payload
+            .starts_with(b"SERVICE=RustNTControl\n"));
+        assert!(
+            String::from_utf8(super::dispatch_command(Command::Capabilities).payload)
+                .expect("capabilities should be UTF-8")
+                .contains("ping,identity,capabilities")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn disconnected_pipe_errors_are_connection_local() {
+        assert!(super::is_pipe_disconnect_code(Some(
+            windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE
+        )));
+        assert!(super::is_pipe_disconnect_code(Some(
+            windows_sys::Win32::Foundation::ERROR_NO_DATA
+        )));
+        assert!(!super::is_pipe_disconnect_code(Some(
+            windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED
+        )));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_server_entrypoint_is_available_to_the_service_host() {
+        let _ = super::run_pipe_server
+            as fn(windows_sys::Win32::Foundation::HANDLE) -> Result<(), super::ServiceError>;
     }
 
     #[cfg(windows)]
