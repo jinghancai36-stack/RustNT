@@ -7,17 +7,20 @@ use std::path::Path;
 #[cfg(windows)]
 use std::ptr;
 #[cfg(windows)]
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+#[cfg(windows)]
 use std::thread;
 #[cfg(windows)]
 use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_MORE_DATA,
-    ERROR_NOT_FOUND, ERROR_NO_DATA, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
-    ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_EXISTS,
-    ERROR_SERVICE_NOT_ACTIVE, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
-    WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, GetLastError, LocalFree, ERROR_BROKEN_PIPE, ERROR_CALL_NOT_IMPLEMENTED,
+    ERROR_INVALID_HANDLE, ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_NOT_FOUND, ERROR_NO_DATA,
+    ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_SERVICE_ALREADY_RUNNING,
+    ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_EXISTS, ERROR_SERVICE_NOT_ACTIVE,
+    ERROR_SERVICE_SPECIFIC_ERROR, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    NO_ERROR, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 #[cfg(windows)]
 use windows_sys::Win32::Security::Authorization::{
@@ -43,16 +46,17 @@ use windows_sys::Win32::System::Pipes::{
 #[cfg(windows)]
 use windows_sys::Win32::System::Services::{
     CloseServiceHandle, ControlService, CreateServiceW, DeleteService, OpenSCManagerW,
-    OpenServiceW, QueryServiceConfigW, QueryServiceStatusEx, StartServiceW, QUERY_SERVICE_CONFIGW,
-    SC_HANDLE, SC_MANAGER_CONNECT, SC_MANAGER_CREATE_SERVICE, SC_STATUS_PROCESS_INFO,
-    SERVICE_CONTROL_STOP, SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL, SERVICE_QUERY_CONFIG,
-    SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START, SERVICE_START_PENDING, SERVICE_STATUS,
-    SERVICE_STATUS_PROCESS, SERVICE_STOP, SERVICE_STOPPED, SERVICE_STOP_PENDING,
-    SERVICE_WIN32_OWN_PROCESS,
+    OpenServiceW, QueryServiceConfigW, QueryServiceStatusEx, RegisterServiceCtrlHandlerExW,
+    SetServiceStatus, StartServiceCtrlDispatcherW, StartServiceW, QUERY_SERVICE_CONFIGW, SC_HANDLE,
+    SC_MANAGER_CONNECT, SC_MANAGER_CREATE_SERVICE, SC_STATUS_PROCESS_INFO, SERVICE_ACCEPT_SHUTDOWN,
+    SERVICE_ACCEPT_STOP, SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_DEMAND_START,
+    SERVICE_ERROR_NORMAL, SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS, SERVICE_RUNNING,
+    SERVICE_START, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_PROCESS, SERVICE_STOP,
+    SERVICE_STOPPED, SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, OpenProcessToken, WaitForMultipleObjects, INFINITE,
+    CreateEventW, GetCurrentProcess, OpenProcessToken, SetEvent, WaitForMultipleObjects, INFINITE,
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED, OVERLAPPED_0};
@@ -121,6 +125,13 @@ pub enum ServiceState {
     StopPending,
     Other(u32),
 }
+
+pub const SERVICE_TRANSITIONS: &[ServiceState] = &[
+    ServiceState::StartPending,
+    ServiceState::Running,
+    ServiceState::StopPending,
+    ServiceState::Stopped,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServiceStatus {
@@ -1646,6 +1657,207 @@ pub(crate) fn run_pipe_server(stop_event: HANDLE) -> Result<(), ServiceError> {
     }
 }
 
+#[cfg(windows)]
+struct ServiceRuntime {
+    status_handle: AtomicPtr<std::ffi::c_void>,
+    stop_event: AtomicPtr<std::ffi::c_void>,
+    running: AtomicBool,
+    stop_event_owner: Option<OwnedHandle>,
+}
+
+#[cfg(windows)]
+impl ServiceRuntime {
+    fn new() -> Self {
+        Self {
+            status_handle: AtomicPtr::new(ptr::null_mut()),
+            stop_event: AtomicPtr::new(ptr::null_mut()),
+            running: AtomicBool::new(false),
+            stop_event_owner: None,
+        }
+    }
+
+    fn clear_stop_event(&mut self) {
+        self.stop_event.store(ptr::null_mut(), Ordering::Release);
+        self.stop_event_owner.take();
+    }
+}
+
+#[cfg(windows)]
+fn report_service_status(
+    context: &ServiceRuntime,
+    state: u32,
+    failure: Option<&ServiceError>,
+) -> Result<(), ServiceError> {
+    let status_handle = context.status_handle.load(Ordering::Acquire);
+    if status_handle.is_null() {
+        return Err(ServiceError::protocol(
+            "report service status",
+            "service status handle is not initialized",
+        ));
+    }
+
+    let (win32_exit_code, service_specific_exit_code) = match failure {
+        Some(error) => (ERROR_SERVICE_SPECIFIC_ERROR, error.code.unwrap_or(1).max(1)),
+        None => (NO_ERROR, NO_ERROR),
+    };
+    let controls_accepted = if state == SERVICE_RUNNING {
+        SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN
+    } else {
+        0
+    };
+    let status = SERVICE_STATUS {
+        dwServiceType: SERVICE_WIN32_OWN_PROCESS,
+        dwCurrentState: state,
+        dwControlsAccepted: controls_accepted,
+        dwWin32ExitCode: win32_exit_code,
+        dwServiceSpecificExitCode: service_specific_exit_code,
+        dwCheckPoint: 0,
+        dwWaitHint: 0,
+    };
+    let result = unsafe {
+        // SAFETY: status_handle was returned by RegisterServiceCtrlHandlerExW and remains
+        // registered until the service entry returns. `status` is live for this call.
+        SetServiceStatus(status_handle, &status)
+    };
+    if result == 0 {
+        Err(ServiceError::windows("report service status"))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+/// The SCM invokes this callback only while the boxed `ServiceRuntime` remains alive.
+/// The context owns the stop event, and this callback performs only atomic reads and
+/// event signaling; it never frees or mutates the context's ownership state.
+unsafe extern "system" fn service_control_handler(
+    control: u32,
+    _event_type: u32,
+    _event_data: *mut std::ffi::c_void,
+    context: *mut std::ffi::c_void,
+) -> u32 {
+    if context.is_null() {
+        return ERROR_INVALID_HANDLE;
+    }
+    let context = &*context.cast::<ServiceRuntime>();
+    match control {
+        SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
+            if !context.running.load(Ordering::Acquire) {
+                return NO_ERROR;
+            }
+            let stop_event = context.stop_event.load(Ordering::Acquire);
+            if stop_event.is_null() {
+                return ERROR_INVALID_HANDLE;
+            }
+            if SetEvent(stop_event) == 0 {
+                GetLastError()
+            } else {
+                NO_ERROR
+            }
+        }
+        _ => ERROR_CALL_NOT_IMPLEMENTED,
+    }
+}
+
+#[cfg(windows)]
+fn run_service_main(context: &mut ServiceRuntime) -> Result<(), ServiceError> {
+    report_service_status(context, SERVICE_START_PENDING, None)?;
+
+    let stop_event = match create_io_event("create RustNT service stop event") {
+        Ok(event) => event,
+        Err(error) => {
+            let _ = report_service_status(context, SERVICE_STOPPED, Some(&error));
+            return Err(error);
+        }
+    };
+    context.stop_event_owner = Some(stop_event);
+    let stop_event = context
+        .stop_event_owner
+        .as_ref()
+        .expect("service stop event was just installed")
+        .get();
+    context.stop_event.store(stop_event, Ordering::Release);
+    context.running.store(true, Ordering::Release);
+
+    if let Err(error) = report_service_status(context, SERVICE_RUNNING, None) {
+        context.running.store(false, Ordering::Release);
+        context.clear_stop_event();
+        let _ = report_service_status(context, SERVICE_STOPPED, Some(&error));
+        return Err(error);
+    }
+
+    let pipe_result = run_pipe_server(stop_event);
+    context.running.store(false, Ordering::Release);
+    let pending_result = report_service_status(context, SERVICE_STOP_PENDING, None);
+
+    // run_pipe_server owns each Pipe instance locally. Clearing the published event pointer
+    // before dropping its owner prevents the callback from observing a closed HANDLE.
+    context.clear_stop_event();
+    let failure = pipe_result.as_ref().err().or(pending_result.as_ref().err());
+    let stopped_result = report_service_status(context, SERVICE_STOPPED, failure);
+
+    match pipe_result {
+        Err(error) => Err(error),
+        Ok(()) => pending_result.and(stopped_result),
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn service_main(
+    _argument_count: u32,
+    _arguments: *mut windows_sys::core::PWSTR,
+) {
+    let mut context = Box::new(ServiceRuntime::new());
+    let context_pointer = (&mut *context as *mut ServiceRuntime).cast();
+    let name = service_name();
+    let status_handle = RegisterServiceCtrlHandlerExW(
+        name.as_ptr(),
+        Some(service_control_handler),
+        context_pointer,
+    );
+    if status_handle.is_null() {
+        eprintln!("rustnt-service handler registration failed");
+        return;
+    }
+    context
+        .status_handle
+        .store(status_handle, Ordering::Release);
+
+    if let Err(error) = run_service_main(&mut context) {
+        eprintln!("rustnt-service host error: {error}");
+    }
+}
+
+#[cfg(windows)]
+pub fn run_service() -> Result<(), ServiceError> {
+    let mut name = service_name();
+    let table = [
+        SERVICE_TABLE_ENTRYW {
+            lpServiceName: name.as_mut_ptr(),
+            lpServiceProc: Some(service_main),
+        },
+        SERVICE_TABLE_ENTRYW {
+            lpServiceName: ptr::null_mut(),
+            lpServiceProc: None,
+        },
+    ];
+    let result = unsafe {
+        // SAFETY: `table` and its UTF-16 service name remain alive until the dispatcher
+        // returns, and the final entry is the required null terminator.
+        StartServiceCtrlDispatcherW(table.as_ptr())
+    };
+    if result == 0 {
+        Err(ServiceError::windows("start service control dispatcher"))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+pub fn run_service() -> Result<(), ServiceError> {
+    Err(ServiceError::protocol("run service", "Windows is required"))
+}
+
 // Keep the Task 04 server call graph type-checked until Task 05's service host
 // becomes its runtime caller, without exposing a raw HANDLE outside this crate.
 #[cfg(windows)]
@@ -1659,9 +1871,22 @@ mod tests {
 
     use super::{
         decode_request, decode_response, encode_request, encode_response, Command, Request,
-        Response, ServiceIdentity, MAX_PAYLOAD, MAX_RESPONSE_FRAME_SIZE, PROTOCOL_VERSION,
-        RESPONSE_HEADER_SIZE, SERVICE_NAME, STATUS_SUCCESS,
+        Response, ServiceIdentity, ServiceState, MAX_PAYLOAD, MAX_RESPONSE_FRAME_SIZE,
+        PROTOCOL_VERSION, RESPONSE_HEADER_SIZE, SERVICE_NAME, SERVICE_TRANSITIONS, STATUS_SUCCESS,
     };
+
+    #[test]
+    fn service_status_sequence_is_start_run_stop() {
+        assert_eq!(
+            SERVICE_TRANSITIONS,
+            &[
+                ServiceState::StartPending,
+                ServiceState::Running,
+                ServiceState::StopPending,
+                ServiceState::Stopped,
+            ]
+        );
+    }
 
     #[test]
     fn identity_payload_contains_stable_fields() {
