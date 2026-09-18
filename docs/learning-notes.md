@@ -69,3 +69,63 @@ are valid.
 Many Windows resources must be released explicitly. RustNT wraps the handles
 used by this task in a small RAII type whose `Drop` implementation calls
 `CloseHandle`, preventing leaks on normal early returns and errors.
+
+## Windows Service and SCM
+
+A Windows service is a process whose lifecycle is coordinated by the Service
+Control Manager (SCM). RustNT registers `RustNTControl` as its own service
+process under `LocalSystem` with demand start. Demand start means installation
+does not launch the process and the service is not configured to start at
+boot; an operator or the SCM must request `start`.
+
+The service reports state transitions instead of appearing instantaneously:
+`START_PENDING` -> `RUNNING` -> `STOP_PENDING` -> `STOPPED`. The CLI asks the
+SCM for these states and waits for the requested terminal state. A running
+status can include the service process ID, while an absent registration is
+reported as `NOT_INSTALLED`.
+
+## Named Pipe framing
+
+The bridge uses the local message-mode Pipe
+`\\.\pipe\RustNT.Control.v1`. A message-mode Pipe preserves each request
+and response as a message boundary, while the RustNT frame still carries
+explicit lengths and a protocol version:
+
+```text
+request:  magic[4] | version[u16] | command[u16] | payload_length[u32] | payload
+response: magic[4] | version[u16] | status[u32] | payload_length[u32] | payload
+```
+
+The decoder rejects bad magic, unsupported versions, unknown commands,
+oversized payloads, and trailing or truncated bytes. Task 03 accepts only
+`PING`, `IDENTITY`, and `CAPABILITIES`, and these commands do not accept a
+request payload.
+
+## DACLs and LocalSystem risk
+
+An access control list on a Named Pipe is part of the security boundary. RustNT
+creates an explicit DACL granting full control to `SYSTEM` and Administrators
+and read/write access to interactive users, and requests
+`PIPE_REJECT_REMOTE_CLIENTS`. This makes the endpoint local and explicit
+instead of inheriting an accidental default security descriptor.
+
+`LocalSystem` has broad operating-system authority. Pipe access alone must not
+be treated as authorization for a future mutating operation. Any future
+privileged action needs a fixed whitelist, connecting-token checks,
+operation-level authorization, input validation, and audit records. RustNT's
+current bridge exposes only read-only identity and capability information plus
+the health-check `PING` command.
+
+## Token identity
+
+A process token describes the security identity under which Windows evaluates
+the process. The service queries its own token for the user SID, integrity
+level, and elevation flag. SID `S-1-5-18` is rendered as `LocalSystem`; the
+identity response also includes protocol version and the fixed capability
+list. This is an observation of the service token, not a claim that every
+client is trusted.
+
+Process-control operations are reserved for Task 04. Administrator command
+execution is reserved for a separately reviewed Task 05 design with explicit
+authorization, auditing, and operation restrictions. Neither future scope is
+implemented here.

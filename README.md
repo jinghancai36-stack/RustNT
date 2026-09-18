@@ -24,5 +24,37 @@ Longer-term experiments may cover process management, filesystem performance,
 Windows Shell components, system monitoring, IPC, Native NT APIs, Windows
 services, and low-latency desktop components.
 
+## Local service bridge
+
+RustNT includes a restricted Windows service bridge for inspecting the service
+identity and protocol capabilities. The service is registered with the Windows
+Service Control Manager (SCM) as `RustNTControl`, runs as `LocalSystem`, and
+uses demand start. It listens only on the local secured Named Pipe
+`\\.\pipe\RustNT.Control.v1`; remote clients are rejected and the Pipe
+has an explicit DACL.
+
+Run the lifecycle explicitly:
+
+```text
+rustnt service install
+rustnt service start
+rustnt service status
+rustnt service identity
+rustnt service stop
+rustnt service uninstall
+```
+
+`status` reports SCM state and the service process ID when Windows provides
+one. `identity` does not start the service implicitly, so run `start` first.
+Task 03 exposes only the fixed protocol commands `PING`, `IDENTITY`, and
+`CAPABILITIES`; `IDENTITY` and `CAPABILITIES` are read-only queries. The
+service does not accept process-control requests, executable paths, arbitrary
+arguments, scripts, or administrator commands.
+
+Process-control operations are reserved for Task 04. Administrator command
+execution is reserved for a separately reviewed Task 05 design with explicit
+authorization, auditing, and operation restrictions. These are separate future
+scopes and are not implemented by this service bridge.
+
 RustNT is a normal Windows user-mode project. It is not an operating system and
 does not replace the Windows kernel, drivers, or compatibility infrastructure.
