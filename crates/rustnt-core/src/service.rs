@@ -961,14 +961,45 @@ pub fn collect_identity() -> Result<ServiceIdentity, ServiceError> {
 }
 
 #[cfg(windows)]
-struct ImpersonationGuard;
+struct ImpersonationGuard {
+    active: bool,
+}
+
+#[cfg(windows)]
+impl ImpersonationGuard {
+    fn new() -> Self {
+        Self { active: true }
+    }
+
+    fn revert_with(&mut self, revert: impl FnOnce() -> bool) -> Result<(), ServiceError> {
+        if !self.active {
+            return Ok(());
+        }
+        if !revert() {
+            return Err(ServiceError::windows(
+                "revert Named Pipe client impersonation",
+            ));
+        }
+        self.active = false;
+        Ok(())
+    }
+
+    fn revert(&mut self) -> Result<(), ServiceError> {
+        self.revert_with(|| unsafe {
+            // SAFETY: The guard is created only after successful pipe-client impersonation.
+            RevertToSelf() != 0
+        })
+    }
+}
 
 #[cfg(windows)]
 impl Drop for ImpersonationGuard {
     fn drop(&mut self) {
-        unsafe {
-            // SAFETY: this guard is created only after successful pipe-client impersonation.
-            RevertToSelf();
+        if self.active {
+            unsafe {
+                // SAFETY: this guard is created only after successful pipe-client impersonation.
+                RevertToSelf();
+            }
         }
     }
 }
@@ -982,7 +1013,7 @@ fn query_pipe_client_security(pipe: HANDLE) -> Result<CallerSecurity, ServiceErr
     if impersonated == 0 {
         return Err(ServiceError::windows("impersonate Named Pipe client"));
     }
-    let _guard = ImpersonationGuard;
+    let mut guard = ImpersonationGuard::new();
 
     let mut token = ptr::null_mut();
     let opened = unsafe {
@@ -1037,11 +1068,13 @@ fn query_pipe_client_security(pipe: HANDLE) -> Result<CallerSecurity, ServiceErr
         return Err(ServiceError::windows("check Administrators membership"));
     }
 
-    Ok(CallerSecurity {
+    let caller = CallerSecurity {
         user_sid,
         elevated: elevation.TokenIsElevated != 0,
         administrator: administrator != 0,
-    })
+    };
+    guard.revert()?;
+    Ok(caller)
 }
 
 #[cfg(not(windows))]
@@ -2314,6 +2347,16 @@ mod tests {
     fn pipe_server_entrypoint_is_available_to_the_service_host() {
         let _ = super::run_pipe_server
             as fn(windows_sys::Win32::Foundation::HANDLE) -> Result<(), super::ServiceError>;
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn impersonation_guard_reports_revert_failure() {
+        let mut guard = super::ImpersonationGuard::new();
+        assert!(guard.revert_with(|| false).is_err());
+        assert!(guard.active);
+        assert!(guard.revert_with(|| true).is_ok());
+        assert!(!guard.active);
     }
 
     #[cfg(windows)]
