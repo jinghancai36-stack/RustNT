@@ -61,6 +61,463 @@ pub struct ProcessInspection {
     pub owner_sid: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallerSecurity {
+    pub user_sid: String,
+    pub elevated: bool,
+    pub administrator: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminationPolicyInput<'a> {
+    pub target_pid: u32,
+    pub service_pid: u32,
+    pub expected_creation_time_100ns: u64,
+    pub target_creation_time_100ns: u64,
+    pub caller_sid: &'a str,
+    pub target_owner_sid: &'a str,
+    pub caller_elevated: bool,
+    pub caller_administrator: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminationRejection {
+    CallerNotElevated,
+    CallerNotAdmin,
+    TargetProtected,
+    TargetNotFound,
+    PidReused,
+    TargetNotOwned,
+    AccessDenied,
+}
+
+impl TerminationRejection {
+    pub(crate) fn status(self) -> ProcessStatus {
+        match self {
+            Self::CallerNotElevated => ProcessStatus::CallerNotElevated,
+            Self::CallerNotAdmin => ProcessStatus::CallerNotAdmin,
+            Self::TargetProtected => ProcessStatus::TargetProtected,
+            Self::TargetNotFound => ProcessStatus::TargetNotFound,
+            Self::PidReused => ProcessStatus::PidReused,
+            Self::TargetNotOwned => ProcessStatus::TargetNotOwned,
+            Self::AccessDenied => ProcessStatus::AccessDenied,
+        }
+    }
+}
+
+pub fn evaluate_termination_policy(
+    input: &TerminationPolicyInput<'_>,
+) -> Result<(), TerminationRejection> {
+    if !input.caller_elevated {
+        return Err(TerminationRejection::CallerNotElevated);
+    }
+    if !input.caller_administrator {
+        return Err(TerminationRejection::CallerNotAdmin);
+    }
+    if input.target_pid == 0 || input.target_pid == 4 || input.target_pid == input.service_pid {
+        return Err(TerminationRejection::TargetProtected);
+    }
+    if input.target_creation_time_100ns != input.expected_creation_time_100ns {
+        return Err(TerminationRejection::PidReused);
+    }
+    if is_system_sid(input.target_owner_sid) {
+        return Err(TerminationRejection::TargetProtected);
+    }
+    if input.target_owner_sid != input.caller_sid {
+        return Err(TerminationRejection::TargetNotOwned);
+    }
+    Ok(())
+}
+
+pub fn is_system_sid(sid: &str) -> bool {
+    matches!(sid, "S-1-5-18" | "S-1-5-19" | "S-1-5-20")
+}
+
+#[cfg(windows)]
+use std::ffi::{c_void, OsString};
+#[cfg(windows)]
+use std::os::windows::ffi::OsStringExt;
+#[cfg(windows)]
+use std::ptr;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, LocalFree, ERROR_ACCESS_DENIED, FILETIME, HANDLE,
+    INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
+#[cfg(windows)]
+use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+#[cfg(windows)]
+use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+#[cfg(windows)]
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{
+    GetProcessTimes, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, TerminateProcess,
+    WaitForSingleObject, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    PROCESS_VM_READ,
+};
+
+#[cfg(windows)]
+struct OwnedHandle(HANDLE);
+
+#[cfg(windows)]
+impl OwnedHandle {
+    fn new(handle: HANDLE, operation: &'static str) -> Result<Self, ProcessControlError> {
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            Err(windows_error(operation))
+        } else {
+            Ok(Self(handle))
+        }
+    }
+
+    fn get(&self) -> HANDLE {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+            unsafe {
+                // SAFETY: this wrapper exclusively owns the Win32 handle and closes it once.
+                CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+struct OwnedLocalBuffer(*mut c_void);
+
+#[cfg(windows)]
+impl Drop for OwnedLocalBuffer {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                // SAFETY: the pointer was returned by a LocalAlloc-backed API and is freed once.
+                LocalFree(self.0);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_error(operation: &'static str) -> ProcessControlError {
+    let code = unsafe {
+        // SAFETY: GetLastError reads the current thread's Win32 error value.
+        GetLastError()
+    };
+    ProcessControlError::Windows { operation, code }
+}
+
+#[cfg(windows)]
+fn target_open_error(operation: &'static str) -> ProcessControlError {
+    match windows_error(operation) {
+        ProcessControlError::Windows {
+            code: ERROR_ACCESS_DENIED,
+            ..
+        } => ProcessControlError::Status(ProcessStatus::TargetAccessDenied),
+        _ => ProcessControlError::Status(ProcessStatus::TargetNotFound),
+    }
+}
+
+#[cfg(windows)]
+fn filetime_to_u64(value: FILETIME) -> u64 {
+    (u64::from(value.dwHighDateTime) << 32) | u64::from(value.dwLowDateTime)
+}
+
+#[cfg(windows)]
+fn wide_string(value: &[u16]) -> String {
+    let length = value
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(value.len());
+    OsString::from_wide(&value[..length])
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(windows)]
+fn process_creation_time(handle: HANDLE) -> Result<u64, ProcessControlError> {
+    let mut creation = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exit = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut kernel = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut user = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let result = unsafe {
+        // SAFETY: handle is valid for this call and all FILETIME pointers target writable locals.
+        GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user)
+    };
+    if result == 0 {
+        Err(windows_error("query process creation time"))
+    } else {
+        Ok(filetime_to_u64(creation))
+    }
+}
+
+#[cfg(windows)]
+fn process_path(handle: HANDLE) -> Option<String> {
+    const PATH_BUFFER_LENGTH: usize = 32_768;
+    let mut buffer = vec![0u16; PATH_BUFFER_LENGTH];
+    let mut length = buffer.len() as u32;
+    let result = unsafe {
+        // SAFETY: handle is valid and buffer/length describe writable storage for the call.
+        QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, buffer.as_mut_ptr(), &mut length)
+    };
+    if result == 0 || length == 0 {
+        None
+    } else {
+        Some(wide_string(&buffer[..length as usize]))
+    }
+}
+
+#[cfg(windows)]
+fn process_memory(handle: HANDLE) -> Option<u64> {
+    let mut counters = PROCESS_MEMORY_COUNTERS {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        // SAFETY: PROCESS_MEMORY_COUNTERS is an integer-only C structure and zero is valid.
+        ..unsafe { std::mem::zeroed() }
+    };
+    let result = unsafe {
+        // SAFETY: handle is valid and counters points to writable storage with cb initialized.
+        GetProcessMemoryInfo(
+            handle,
+            &mut counters,
+            std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        )
+    };
+    (result != 0).then_some(counters.WorkingSetSize as u64)
+}
+
+#[cfg(windows)]
+fn process_owner_sid(handle: HANDLE) -> Result<String, ProcessControlError> {
+    let mut token = ptr::null_mut();
+    let opened = unsafe {
+        // SAFETY: handle is a valid process handle and token points to writable handle storage.
+        OpenProcessToken(handle, TOKEN_QUERY, &mut token)
+    };
+    if opened == 0 {
+        return Err(windows_error("open target process token"));
+    }
+    let token = OwnedHandle::new(token, "open target process token")?;
+
+    let mut required = 0u32;
+    let _ = unsafe {
+        // SAFETY: null buffer and zero length request the required TokenUser size.
+        GetTokenInformation(token.get(), TokenUser, ptr::null_mut(), 0, &mut required)
+    };
+    if required == 0 {
+        return Err(windows_error("query target token user size"));
+    }
+    let mut buffer = vec![0u8; required as usize];
+    let queried = unsafe {
+        // SAFETY: buffer is sized by the preceding query and writable for required bytes.
+        GetTokenInformation(
+            token.get(),
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            required,
+            &mut required,
+        )
+    };
+    if queried == 0 {
+        return Err(windows_error("query target token user"));
+    }
+    let user = unsafe {
+        // SAFETY: TokenUser data begins with TOKEN_USER in the returned buffer.
+        &*buffer.as_ptr().cast::<TOKEN_USER>()
+    };
+    if user.User.Sid.is_null() {
+        return Err(ProcessControlError::InvalidField(
+            "target owner SID".to_string(),
+        ));
+    }
+    let mut string_sid = ptr::null_mut();
+    let converted = unsafe {
+        // SAFETY: SID points into the live token buffer and string_sid is writable output storage.
+        ConvertSidToStringSidW(user.User.Sid, &mut string_sid)
+    };
+    if converted == 0 || string_sid.is_null() {
+        return Err(windows_error("convert target owner SID"));
+    }
+    let string_sid = OwnedLocalBuffer(string_sid.cast());
+    let sid = unsafe {
+        // SAFETY: ConvertSidToStringSidW returned a live nul-terminated LocalAlloc buffer.
+        wide_string_from_ptr(string_sid.0.cast())
+    };
+    Ok(sid)
+}
+
+#[cfg(windows)]
+unsafe fn wide_string_from_ptr(value: *const u16) -> String {
+    if value.is_null() {
+        return String::new();
+    }
+    let mut result = Vec::new();
+    let mut current = value;
+    // SAFETY: caller guarantees readable UTF-16 storage through its terminating nul.
+    while *current != 0 {
+        result.push(*current);
+        current = current.add(1);
+    }
+    String::from_utf16_lossy(&result)
+}
+
+#[cfg(windows)]
+fn process_entry(pid: u32) -> Result<(String, u32), ProcessControlError> {
+    let snapshot = unsafe {
+        // SAFETY: the flags request a system process snapshot and no pointer is retained.
+        CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    };
+    let snapshot = OwnedHandle::new(snapshot, "create process snapshot")?;
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        // SAFETY: PROCESSENTRY32W is a fixed-layout integer/array structure.
+        ..unsafe { std::mem::zeroed() }
+    };
+    let first = unsafe {
+        // SAFETY: snapshot is valid and entry has the required dwSize.
+        Process32FirstW(snapshot.get(), &mut entry)
+    };
+    if first == 0 {
+        return Err(ProcessControlError::Status(ProcessStatus::TargetNotFound));
+    }
+    loop {
+        if entry.th32ProcessID == pid {
+            return Ok((wide_string(&entry.szExeFile), entry.cntThreads));
+        }
+        let next = unsafe {
+            // SAFETY: snapshot and entry remain valid during enumeration.
+            Process32NextW(snapshot.get(), &mut entry)
+        };
+        if next == 0 {
+            return Err(ProcessControlError::Status(ProcessStatus::TargetNotFound));
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn inspect_process(
+    pid: u32,
+    service_pid: u32,
+) -> Result<ProcessInspection, ProcessControlError> {
+    if pid == 0 || pid == 4 || pid == service_pid {
+        return Err(ProcessControlError::Status(ProcessStatus::TargetProtected));
+    }
+    let handle = unsafe {
+        // SAFETY: pid is used only as a process identifier; the returned handle is checked.
+        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, 0, pid)
+    };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Err(target_open_error("open target process"));
+    }
+    let handle = OwnedHandle::new(handle, "open target process")?;
+    let (image_name, thread_count) = process_entry(pid)?;
+    let creation_time_100ns = process_creation_time(handle.get())?;
+    let owner_sid = process_owner_sid(handle.get())?;
+    let image_path = process_path(handle.get())
+        .map(|path| sanitize_field(&path))
+        .transpose()?;
+    Ok(ProcessInspection {
+        pid,
+        creation_time_100ns,
+        image_name: sanitize_field(&image_name)?,
+        image_path,
+        thread_count,
+        memory_bytes: process_memory(handle.get()),
+        owner_sid: sanitize_field(&owner_sid)?,
+    })
+}
+
+#[cfg(windows)]
+pub(crate) fn terminate_process(
+    request: &ProcessTerminateRequest,
+    caller: &CallerSecurity,
+    service_pid: u32,
+) -> Result<ProcessStatus, ProcessControlError> {
+    if !caller.elevated {
+        return Err(ProcessControlError::Status(
+            ProcessStatus::CallerNotElevated,
+        ));
+    }
+    if !caller.administrator {
+        return Err(ProcessControlError::Status(ProcessStatus::CallerNotAdmin));
+    }
+    if request.pid == 0 || request.pid == 4 || request.pid == service_pid {
+        return Err(ProcessControlError::Status(ProcessStatus::TargetProtected));
+    }
+    let handle = unsafe {
+        // SAFETY: pid is used only as an identifier; the returned handle is checked and owned.
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+            0,
+            request.pid,
+        )
+    };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        let error = windows_error("open target process");
+        return Err(match error {
+            ProcessControlError::Windows {
+                code: ERROR_ACCESS_DENIED,
+                ..
+            } => ProcessControlError::Status(ProcessStatus::AccessDenied),
+            _ => ProcessControlError::Status(ProcessStatus::TargetNotFound),
+        });
+    }
+    let handle = OwnedHandle::new(handle, "open target process")?;
+    let target_creation_time_100ns = process_creation_time(handle.get())?;
+    let target_owner_sid = process_owner_sid(handle.get())?;
+    let policy = TerminationPolicyInput {
+        target_pid: request.pid,
+        service_pid,
+        expected_creation_time_100ns: request.expected_creation_time_100ns,
+        target_creation_time_100ns,
+        caller_sid: &caller.user_sid,
+        target_owner_sid: &target_owner_sid,
+        caller_elevated: caller.elevated,
+        caller_administrator: caller.administrator,
+    };
+    if let Err(rejection) = evaluate_termination_policy(&policy) {
+        return Err(ProcessControlError::Status(rejection.status()));
+    }
+    let terminated = unsafe {
+        // SAFETY: handle is valid and owned; exit code 1 is fixed by the implementation.
+        TerminateProcess(handle.get(), 1)
+    };
+    if terminated == 0 {
+        return Err(ProcessControlError::Status(ProcessStatus::AccessDenied));
+    }
+    let wait = unsafe {
+        // SAFETY: handle remains valid until the bounded wait returns.
+        WaitForSingleObject(handle.get(), 2_000)
+    };
+    match wait {
+        WAIT_OBJECT_0 => Ok(ProcessStatus::Terminated),
+        WAIT_TIMEOUT => Ok(ProcessStatus::TerminatePending),
+        WAIT_FAILED => Err(windows_error("wait for terminated process")),
+        _ => Err(ProcessControlError::Windows {
+            operation: "wait for terminated process",
+            code: wait,
+        }),
+    }
+}
+
 pub fn encode_inspect_request(pid: u32) -> Result<Vec<u8>, ProcessControlError> {
     validate_pid(pid)?;
     Ok(pid.to_le_bytes().to_vec())
@@ -307,7 +764,8 @@ mod tests {
     use super::{
         decode_inspect_request, decode_inspection_payload, decode_status_payload,
         decode_terminate_request, encode_inspect_request, encode_inspection_payload,
-        encode_status_payload, encode_terminate_request, ProcessInspection, ProcessStatus,
+        encode_status_payload, encode_terminate_request, evaluate_termination_policy,
+        ProcessInspection, ProcessStatus, TerminationPolicyInput, TerminationRejection,
     };
 
     fn sample_inspection(image_name: &str) -> ProcessInspection {
@@ -393,5 +851,136 @@ mod tests {
                 status
             );
         }
+    }
+
+    fn policy_input(
+        mutate: impl FnOnce(&mut TerminationPolicyInput<'static>),
+    ) -> TerminationPolicyInput<'static> {
+        let mut input = TerminationPolicyInput {
+            target_pid: 9002,
+            service_pid: 9001,
+            expected_creation_time_100ns: 1234,
+            target_creation_time_100ns: 1234,
+            caller_sid: "S-1-5-21-user",
+            target_owner_sid: "S-1-5-21-user",
+            caller_elevated: true,
+            caller_administrator: true,
+        };
+        mutate(&mut input);
+        input
+    }
+
+    #[test]
+    fn termination_policy_rejects_non_elevated_callers_before_target_metadata() {
+        let input = policy_input(|input| input.caller_elevated = false);
+        assert_eq!(
+            evaluate_termination_policy(&input),
+            Err(TerminationRejection::CallerNotElevated)
+        );
+    }
+
+    #[test]
+    fn termination_policy_rejects_non_admin_callers() {
+        let input = policy_input(|input| input.caller_administrator = false);
+        assert_eq!(
+            evaluate_termination_policy(&input),
+            Err(TerminationRejection::CallerNotAdmin)
+        );
+    }
+
+    #[test]
+    fn termination_policy_rejects_pid_zero_pid_four_and_service_pid() {
+        for pid in [0, 4, 9001] {
+            let input = policy_input(|input| {
+                input.target_pid = pid;
+                input.service_pid = 9001;
+            });
+            assert_eq!(
+                evaluate_termination_policy(&input),
+                Err(TerminationRejection::TargetProtected)
+            );
+        }
+    }
+
+    #[test]
+    fn termination_policy_rejects_creation_time_mismatch() {
+        let input = policy_input(|input| input.target_creation_time_100ns += 1);
+        assert_eq!(
+            evaluate_termination_policy(&input),
+            Err(TerminationRejection::PidReused)
+        );
+    }
+
+    #[test]
+    fn termination_policy_rejects_foreign_and_system_owned_targets() {
+        let foreign = policy_input(|input| input.target_owner_sid = "S-1-5-21-foreign");
+        assert_eq!(
+            evaluate_termination_policy(&foreign),
+            Err(TerminationRejection::TargetNotOwned)
+        );
+
+        let system = policy_input(|input| input.target_owner_sid = "S-1-5-18");
+        assert_eq!(
+            evaluate_termination_policy(&system),
+            Err(TerminationRejection::TargetProtected)
+        );
+    }
+
+    #[test]
+    fn termination_policy_allows_elevated_admin_for_caller_owned_target() {
+        let input = policy_input(|_| {});
+        assert_eq!(evaluate_termination_policy(&input), Ok(()));
+    }
+
+    #[test]
+    fn termination_policy_is_system_sid_exact() {
+        assert!(super::is_system_sid("S-1-5-18"));
+        assert!(super::is_system_sid("S-1-5-19"));
+        assert!(super::is_system_sid("S-1-5-20"));
+        assert!(!super::is_system_sid("S-1-5-21-user"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn inspect_process_returns_creation_owner_and_image_metadata() {
+        let inspection = super::inspect_process(std::process::id(), u32::MAX)
+            .expect("current process should be inspectable");
+        assert_eq!(inspection.pid, std::process::id());
+        assert!(inspection.creation_time_100ns > 0);
+        assert!(!inspection.image_name.is_empty());
+        assert!(!inspection.owner_sid.is_empty());
+        assert!(inspection.thread_count > 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn inspect_process_rejects_reserved_pid_values() {
+        assert_eq!(
+            super::inspect_process(0, u32::MAX).expect_err("PID 0 must be rejected"),
+            super::ProcessControlError::Status(ProcessStatus::TargetProtected)
+        );
+        assert_eq!(
+            super::inspect_process(4, u32::MAX).expect_err("PID 4 must be rejected"),
+            super::ProcessControlError::Status(ProcessStatus::TargetProtected)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn terminate_process_rejects_unauthorized_callers_before_opening_target() {
+        let request = super::ProcessTerminateRequest {
+            pid: u32::MAX,
+            expected_creation_time_100ns: 1,
+        };
+        let caller = super::CallerSecurity {
+            user_sid: "S-1-5-21-user".to_string(),
+            elevated: false,
+            administrator: false,
+        };
+        assert_eq!(
+            super::terminate_process(&request, &caller, u32::MAX - 1)
+                .expect_err("unauthorized termination must be rejected"),
+            super::ProcessControlError::Status(ProcessStatus::CallerNotElevated)
+        );
     }
 }

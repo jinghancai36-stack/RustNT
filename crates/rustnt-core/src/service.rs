@@ -1,5 +1,11 @@
 use std::fmt;
 
+use crate::process_control::{
+    decode_inspect_request, decode_terminate_request, encode_inspection_payload,
+    encode_status_payload, inspect_process, terminate_process, CallerSecurity, ProcessControlError,
+    ProcessStatus,
+};
+
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 #[cfg(windows)]
@@ -29,9 +35,12 @@ use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION,
 };
 #[cfg(windows)]
+use windows_sys::Win32::Security::RevertToSelf;
+#[cfg(windows)]
 use windows_sys::Win32::Security::{
-    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenElevation,
-    TokenIntegrityLevel, TokenUser, SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL,
+    CheckTokenMembership, CreateWellKnownSid, GetSidSubAuthority, GetSidSubAuthorityCount,
+    GetTokenInformation, TokenElevation, TokenIntegrityLevel, TokenUser,
+    WinBuiltinAdministratorsSid, SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL,
     TOKEN_QUERY, TOKEN_USER,
 };
 #[cfg(windows)]
@@ -41,9 +50,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, SetNamedPipeHandleState,
-    WaitNamedPipeW, PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE,
-    PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, ImpersonateNamedPipeClient,
+    SetNamedPipeHandleState, WaitNamedPipeW, PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS,
+    PIPE_TYPE_MESSAGE, PIPE_WAIT,
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::Services::{
@@ -58,7 +67,8 @@ use windows_sys::Win32::System::Services::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, OpenProcessToken, SetEvent, WaitForMultipleObjects, INFINITE,
+    CreateEventW, GetCurrentProcess, GetCurrentProcessId, GetCurrentThread, OpenProcessToken,
+    OpenThreadToken, SetEvent, WaitForMultipleObjects, INFINITE,
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED, OVERLAPPED_0};
@@ -950,6 +960,90 @@ pub fn collect_identity() -> Result<ServiceIdentity, ServiceError> {
     })
 }
 
+#[cfg(windows)]
+struct ImpersonationGuard;
+
+#[cfg(windows)]
+impl Drop for ImpersonationGuard {
+    fn drop(&mut self) {
+        unsafe {
+            // SAFETY: this guard is created only after successful pipe-client impersonation.
+            RevertToSelf();
+        }
+    }
+}
+
+#[cfg(windows)]
+fn query_pipe_client_security(pipe: HANDLE) -> Result<CallerSecurity, ServiceError> {
+    let impersonated = unsafe {
+        // SAFETY: pipe is the connected server-side Named Pipe handle for this request.
+        ImpersonateNamedPipeClient(pipe)
+    };
+    if impersonated == 0 {
+        return Err(ServiceError::windows("impersonate Named Pipe client"));
+    }
+    let _guard = ImpersonationGuard;
+
+    let mut token = ptr::null_mut();
+    let opened = unsafe {
+        // SAFETY: GetCurrentThread returns a pseudo-handle; token is writable output storage.
+        OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token)
+    };
+    if opened == 0 {
+        return Err(ServiceError::windows("open Named Pipe client token"));
+    }
+    let token = OwnedToken(token);
+
+    let user = query_token_information(token.get(), TokenUser, "query client token user")?;
+    let user = unsafe {
+        // SAFETY: the query filled a TOKEN_USER structure at the buffer start.
+        &*user.as_ptr().cast::<TOKEN_USER>()
+    };
+    checked_pointer(user.User.Sid.cast_const(), "query client token SID")?;
+    let user_sid = sid_string(user.User.Sid)?;
+
+    let elevation =
+        query_token_information(token.get(), TokenElevation, "query client token elevation")?;
+    let elevation = unsafe {
+        // SAFETY: the query filled a TOKEN_ELEVATION structure at the buffer start.
+        &*elevation.as_ptr().cast::<TOKEN_ELEVATION>()
+    };
+
+    let mut administrator_sid = [0u8; 68];
+    let mut administrator_sid_length = administrator_sid.len() as u32;
+    let sid_created = unsafe {
+        // SAFETY: the fixed buffer is large enough for the Administrators well-known SID and
+        // the output length pointer is writable for the duration of the call.
+        CreateWellKnownSid(
+            WinBuiltinAdministratorsSid,
+            ptr::null_mut(),
+            administrator_sid.as_mut_ptr().cast(),
+            &mut administrator_sid_length,
+        )
+    };
+    if sid_created == 0 {
+        return Err(ServiceError::windows("create Administrators SID"));
+    }
+    let mut administrator = 0;
+    let membership_checked = unsafe {
+        // SAFETY: the token and well-known SID remain live for the membership query.
+        CheckTokenMembership(
+            token.get(),
+            administrator_sid.as_mut_ptr().cast(),
+            &mut administrator,
+        )
+    };
+    if membership_checked == 0 {
+        return Err(ServiceError::windows("check Administrators membership"));
+    }
+
+    Ok(CallerSecurity {
+        user_sid,
+        elevated: elevation.TokenIsElevated != 0,
+        administrator: administrator != 0,
+    })
+}
+
 #[cfg(not(windows))]
 pub fn collect_identity() -> Result<ServiceIdentity, ServiceError> {
     Err(ServiceError::protocol(
@@ -978,20 +1072,95 @@ fn dispatch_command(command: Command) -> Response {
         Command::ProcessInspect | Command::ProcessTerminate => {
             request_error_response(ServiceError::protocol(
                 "dispatch command",
-                "process-control dispatch is not connected yet",
+                "process command requires a request payload",
             ))
         }
     }
 }
 
-fn dispatch_request(request: Request) -> Response {
-    if request.payload.is_empty() {
-        dispatch_command(request.command)
-    } else {
-        request_error_response(ServiceError::protocol(
-            "dispatch request",
-            "Task 03 commands do not accept request payloads",
-        ))
+fn process_error_response(error: ProcessControlError) -> Response {
+    match error {
+        ProcessControlError::Status(status) => Response {
+            status: STATUS_ERROR,
+            payload: encode_status_payload(status),
+        },
+        ProcessControlError::InvalidPayload(message) => {
+            request_error_response(ServiceError::protocol("process control request", message))
+        }
+        ProcessControlError::InvalidField(field) => request_error_response(ServiceError::protocol(
+            "process control request",
+            format!("invalid field {field}"),
+        )),
+        ProcessControlError::OversizedPayload => request_error_response(ServiceError::protocol(
+            "process control response",
+            "payload exceeds service frame limit",
+        )),
+        ProcessControlError::Windows { operation, code } => request_error_response(ServiceError {
+            operation,
+            code: Some(code),
+            message: "Windows process operation failed".to_string(),
+        }),
+    }
+}
+
+#[cfg(windows)]
+fn dispatch_request(pipe: HANDLE, request: Request) -> Response {
+    match request.command {
+        Command::Ping | Command::Identity | Command::Capabilities => {
+            if request.payload.is_empty() {
+                dispatch_command(request.command)
+            } else {
+                request_error_response(ServiceError::protocol(
+                    "dispatch request",
+                    "read-only service commands do not accept request payloads",
+                ))
+            }
+        }
+        Command::ProcessInspect => {
+            let request = match decode_inspect_request(&request.payload) {
+                Ok(request) => request,
+                Err(error) => return process_error_response(error),
+            };
+            match inspect_process(request.pid, unsafe {
+                // SAFETY: GetCurrentProcessId has no pointer or handle preconditions.
+                GetCurrentProcessId()
+            }) {
+                Ok(inspection) => match encode_inspection_payload(&inspection, MAX_PAYLOAD) {
+                    Ok(payload) => Response {
+                        status: STATUS_SUCCESS,
+                        payload,
+                    },
+                    Err(error) => process_error_response(error),
+                },
+                Err(error) => process_error_response(error),
+            }
+        }
+        Command::ProcessTerminate => {
+            let request = match decode_terminate_request(&request.payload) {
+                Ok(request) => request,
+                Err(error) => return process_error_response(error),
+            };
+            let caller = match query_pipe_client_security(pipe) {
+                Ok(caller) => caller,
+                Err(error) => return request_error_response(error),
+            };
+            match terminate_process(&request, &caller, unsafe {
+                // SAFETY: GetCurrentProcessId has no pointer or handle preconditions.
+                GetCurrentProcessId()
+            }) {
+                Ok(status @ (ProcessStatus::Terminated | ProcessStatus::TerminatePending)) => {
+                    Response {
+                        status: STATUS_SUCCESS,
+                        payload: encode_status_payload(status),
+                    }
+                }
+                Ok(status) => Response {
+                    status: STATUS_ERROR,
+                    payload: encode_status_payload(status),
+                },
+                Err(error) => process_error_response(error),
+            }
+        }
     }
 }
 
@@ -1008,7 +1177,7 @@ pub struct ServiceClient;
 
 #[cfg(windows)]
 impl ServiceClient {
-    pub fn request(&self, command: Command) -> Result<Response, ServiceError> {
+    pub fn request(&self, command: Command, payload: &[u8]) -> Result<Response, ServiceError> {
         let name = wide_null(PIPE_NAME);
         let deadline = Instant::now() + Duration::from_millis(PIPE_TIMEOUT_MS as u64);
         let pipe = loop {
@@ -1066,7 +1235,7 @@ impl ServiceClient {
 
         let request = encode_request(&Request {
             command,
-            payload: Vec::new(),
+            payload: payload.to_vec(),
         })?;
         write_sync_pipe_message(pipe.get(), &request, "write RustNT pipe request")?;
 
@@ -1098,7 +1267,7 @@ impl ServiceClient {
 
 #[cfg(not(windows))]
 impl ServiceClient {
-    pub fn request(&self, _command: Command) -> Result<Response, ServiceError> {
+    pub fn request(&self, _command: Command, _payload: &[u8]) -> Result<Response, ServiceError> {
         Err(ServiceError::protocol(
             "request RustNT service pipe",
             "Windows is required",
@@ -1632,7 +1801,7 @@ pub(crate) fn run_pipe_server(stop_event: HANDLE) -> Result<(), ServiceError> {
             INFINITE,
         ) {
             Ok(request_size) => match decode_request(&request_buffer[..request_size]) {
-                Ok(request) => dispatch_request(request),
+                Ok(request) => dispatch_request(pipe.get(), request),
                 Err(error) => request_error_response(error),
             },
             Err(PipeIoError::Stopped) => return Ok(()),
@@ -2085,6 +2254,31 @@ mod tests {
             super::dispatch_command(Command::Capabilities).payload,
             b"ping,identity,capabilities,process_inspect,process_terminate\n"
         );
+    }
+
+    #[cfg(windows)]
+    fn dispatch_request_for_test(request: Request) -> Response {
+        super::dispatch_request(std::ptr::null_mut(), request)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn process_inspect_dispatch_rejects_wrong_payload_shape_without_opening_a_process() {
+        let response = dispatch_request_for_test(Request {
+            command: Command::ProcessInspect,
+            payload: vec![1, 2, 3],
+        });
+        assert_eq!(response.status, super::STATUS_ERROR);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn process_terminate_dispatch_rejects_wrong_payload_shape_without_authorization() {
+        let response = dispatch_request_for_test(Request {
+            command: Command::ProcessTerminate,
+            payload: vec![1; 11],
+        });
+        assert_eq!(response.status, super::STATUS_ERROR);
     }
 
     #[test]
