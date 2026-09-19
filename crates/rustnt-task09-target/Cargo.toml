@@ -1,0 +1,5 @@
+[package]
+name = "rustnt-task09-target"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
