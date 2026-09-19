@@ -121,11 +121,12 @@ connection and returns the server to its next one-instance accept loop. `ACK1`
 is a transport-level response confirmation, not a fourth protocol command.
 
 The decoder validates magic, protocol version, known command, exact frame
-length, and the 4096-byte payload limit. The only protocol commands are
-`PING`, `IDENTITY`, and `CAPABILITIES`. Requests for these Task 03 commands
-carry no payload. `PING` returns an empty success response,
-`IDENTITY` returns service-token fields, and `CAPABILITIES` returns the fixed
-allowlist `ping,identity,capabilities`.
+length, and the 4096-byte payload limit. The fixed protocol commands are
+`PING`, `IDENTITY`, `CAPABILITIES`, `PROCESS_INSPECT`, and
+`PROCESS_TERMINATE`. Requests for the first three commands carry no payload.
+`PING` returns an empty success response, `IDENTITY` returns service-token
+fields, and `CAPABILITIES` returns the fixed allowlist
+`ping,identity,capabilities,process_inspect,process_terminate`.
 
 ### Token identity and privilege boundary
 
@@ -137,16 +138,46 @@ local client path into a system-level execution path. The explicit Pipe DACL
 and remote rejection reduce exposure, but they are not operation-level
 authorization for future dangerous actions.
 
-For that reason, future privileged actions require a whitelist rather than
-free-form command dispatch. Each operation must be explicitly named,
-validated, authorized against the connecting token, and audited. Task 03 has
-no process-control or arbitrary administrator-command implementation.
+For that reason, privileged actions use a fixed whitelist rather than
+free-form command dispatch. Each operation is explicitly named, validated,
+authorized against the connecting token, and kept connection-local on failure.
+There is still no arbitrary administrator-command or script endpoint.
 
-Task 04 and Task 05 are future product-scope labels in the roadmap. The current
-Task 04/05 work only establishes this service-bridge foundation; it does not
-implement process control or administrator command execution. Those future
-scopes remain separate and require explicit authorization, auditing, and
-operation restrictions.
+## Task 08 controlled process management
+
+The process-control path is intentionally narrow:
+
+```text
+CLI PID validation
+    -> service-running check
+    -> PROCESS_INSPECT
+    -> creation-time capture
+    -> PROCESS_TERMINATE
+    -> client-token impersonation
+    -> elevated + local-admin check
+    -> target handle query
+    -> creation-time and owner-SID recheck
+    -> protected-target policy
+    -> TerminateProcess + 2-second wait
+```
+
+`PROCESS_INSPECT` accepts exactly one PID and returns only bounded key-value
+metadata: PID, creation time, image name/path, thread count, best-effort
+memory, and owner SID. It refuses PID 0, PID 4, and the RustNT service.
+
+`PROCESS_TERMINATE` accepts exactly one PID and the creation timestamp captured
+by inspection. The service impersonates the connecting Pipe client for every
+terminate request, requires a local elevated Administrator token, then reverts
+impersonation before using the LocalSystem service token to open and terminate
+the target. The target owner SID must match the caller SID, and SYSTEM,
+LocalService, NetworkService, foreign-user, PID-reused, and protected targets
+are rejected. The target HANDLE is owned only for the request and is closed
+after the bounded wait.
+
+Pipe ACLs and remote-client rejection protect transport exposure but are not
+operation-level authorization. The destructive operation uses fixed status
+names, a fixed nonzero exit code, and no caller-selected access mask, timeout,
+path, name, command line, or script.
 
 All SCM, Pipe, event, and token HANDLE values are owned by local RAII wrappers
 in the core service module. Unsafe FFI blocks keep nearby safety comments for

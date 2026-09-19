@@ -95,3 +95,46 @@ The Pipe round-trip measurement should identify which fixed command was sent
 response time. Identity duration should include the service token query and
 response decoding, not service startup. No measured values are asserted in
 this document.
+
+## Task 08 process-management measurements
+
+Task08 measurements must identify the target class and authorization context.
+Use a monotonic timer and retain raw samples. Do not terminate a production
+process as a benchmark target; use a disposable caller-owned helper process.
+
+Record:
+
+- Windows edition and exact version/build;
+- Rust toolchain, commit, and build profile;
+- caller account, elevation, and local Administrators membership;
+- service state before each run;
+- target PID class: normal user process, PID 4, service process, foreign-user,
+  or system-owned process;
+- request exit code, fixed status payload, and cleanup result.
+
+```text
+Date/time:
+Commit:
+Windows edition/version/build:
+Machine:
+Account:
+Elevated: yes/no
+Administrator member: yes/no
+Service state before run:
+Repetitions:
+Timer and units:
+
+Measurement                              | Samples / summary | Exit codes
+process inspect round-trip latency       |                    |
+non-elevated/admin rejection latency     |                    |
+caller-owned terminate-to-stopped time   |                    |
+PID-reuse rejection round-trip latency   |                    |
+
+Notes, Win32 errors, and cleanup result:
+```
+
+The inspect measurement should use a known disposable or ordinary user-owned
+process and record the returned creation time and owner SID. The authorization
+rejection measurement must not disclose target metadata. The terminate
+measurement ends when the helper is reported as `TERMINATED`; a
+`TERMINATE_PENDING` result is recorded separately and is not retried blindly.
