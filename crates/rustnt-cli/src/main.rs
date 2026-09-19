@@ -26,6 +26,14 @@ enum ServiceCommand {
     Identity,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProcessCommand {
+    List(Options),
+    Inspect { pid: u32 },
+    Terminate { pid: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Options {
     watch_seconds: Option<u64>,
     filter: Option<String>,
@@ -38,13 +46,13 @@ fn main() -> ExitCode {
         return run_service_cli(&args[1..]);
     }
 
-    if args.len() < 2 || args[0] != "process" || args[1] != "list" {
+    if args.first().map(String::as_str) != Some("process") {
         print_usage();
         return ExitCode::from(2);
     }
 
-    let options = match parse_options(&args[2..]) {
-        Ok(options) => options,
+    let command = match parse_process_command(&args[1..]) {
+        Ok(command) => command,
         Err(error) => {
             eprintln!("usage error: {error}");
             print_usage();
@@ -52,25 +60,11 @@ fn main() -> ExitCode {
         }
     };
 
-    if let Some(interval) = options.watch_seconds {
-        match run_watch(&options, interval) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("error: {error}");
-                ExitCode::from(1)
-            }
-        }
-    } else {
-        match rustnt_core::list_processes() {
-            Ok(processes) => {
-                let processes = filter_processes(processes, &options);
-                println!("{}", render_processes(&processes, options.sort));
-                ExitCode::SUCCESS
-            }
-            Err(error) => {
-                eprintln!("error: {error}");
-                ExitCode::from(1)
-            }
+    match run_process_command(command) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::from(1)
         }
     }
 }
@@ -78,8 +72,177 @@ fn main() -> ExitCode {
 fn print_usage() {
     eprintln!(
         "usage: rustnt process list [--watch <seconds>] [--filter <text>] \
-         [--sort <pid|name|cpu|memory>]"
+         [--sort <pid|name|cpu|memory>]\n\
+         usage: rustnt process inspect --pid <PID>\n\
+         usage: rustnt process terminate --pid <PID>"
     );
+}
+
+fn parse_process_command(args: &[String]) -> Result<ProcessCommand, String> {
+    let command = args
+        .first()
+        .map(String::as_str)
+        .ok_or_else(|| "process requires a command".to_string())?;
+    match command {
+        "list" => parse_options(&args[1..]).map(ProcessCommand::List),
+        "inspect" => parse_pid_option(&args[1..]).map(|pid| ProcessCommand::Inspect { pid }),
+        "terminate" => parse_pid_option(&args[1..]).map(|pid| ProcessCommand::Terminate { pid }),
+        command => Err(format!("unknown process command: {command}")),
+    }
+}
+
+fn parse_pid_option(args: &[String]) -> Result<u32, String> {
+    if args.len() != 2 || args[0] != "--pid" || args[1].starts_with('-') {
+        return Err("process command requires exactly --pid <positive decimal PID>".to_string());
+    }
+    let pid = args[1]
+        .parse::<u32>()
+        .map_err(|_| "PID must be a positive decimal u32".to_string())?;
+    if pid == 0 {
+        return Err("PID must be greater than zero".to_string());
+    }
+    Ok(pid)
+}
+
+fn run_process_command(command: ProcessCommand) -> Result<(), String> {
+    match command {
+        ProcessCommand::List(options) => {
+            if let Some(interval) = options.watch_seconds {
+                run_watch(&options, interval).map_err(|error| error.to_string())
+            } else {
+                let processes = rustnt_core::list_processes().map_err(|error| error.to_string())?;
+                let processes = filter_processes(processes, &options);
+                println!("{}", render_processes(&processes, options.sort));
+                Ok(())
+            }
+        }
+        ProcessCommand::Inspect { pid } => run_process_inspect(pid),
+        ProcessCommand::Terminate { pid } => run_process_terminate(pid),
+    }
+}
+
+fn ensure_service_running() -> Result<(), String> {
+    let status = rustnt_core::service::query_service_status().map_err(|error| error.to_string())?;
+    if matches!(
+        status.state,
+        rustnt_core::service::ServiceState::NotInstalled
+            | rustnt_core::service::ServiceState::Stopped
+    ) {
+        Err("service is not running; run rustnt service start".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn request_process(
+    command: rustnt_core::service::Command,
+    payload: &[u8],
+) -> Result<rustnt_core::service::Response, String> {
+    rustnt_core::service::ServiceClient
+        .request(command, payload)
+        .map_err(|error| error.to_string())
+}
+
+fn run_process_inspect(pid: u32) -> Result<(), String> {
+    ensure_service_running()?;
+    let payload = rustnt_core::process_control::encode_inspect_request(pid)
+        .map_err(|error| error.to_string())?;
+    let response = request_process(rustnt_core::service::Command::ProcessInspect, &payload)?;
+    if response.status != rustnt_core::service::STATUS_SUCCESS {
+        return Err(render_process_error(&response.payload));
+    }
+    let inspection = rustnt_core::process_control::decode_inspection_payload(&response.payload)
+        .map_err(|error| error.to_string())?;
+    println!("{}", render_process_inspection(&inspection));
+    Ok(())
+}
+
+fn run_process_terminate(pid: u32) -> Result<(), String> {
+    ensure_service_running()?;
+    let inspect_payload = rustnt_core::process_control::encode_inspect_request(pid)
+        .map_err(|error| error.to_string())?;
+    let inspection_response = request_process(
+        rustnt_core::service::Command::ProcessInspect,
+        &inspect_payload,
+    )?;
+    if inspection_response.status != rustnt_core::service::STATUS_SUCCESS {
+        return Err(render_process_error(&inspection_response.payload));
+    }
+    let inspection =
+        rustnt_core::process_control::decode_inspection_payload(&inspection_response.payload)
+            .map_err(|error| error.to_string())?;
+    let terminate_payload =
+        rustnt_core::process_control::encode_terminate_request(pid, inspection.creation_time_100ns)
+            .map_err(|error| error.to_string())?;
+    let response = request_process(
+        rustnt_core::service::Command::ProcessTerminate,
+        &terminate_payload,
+    )?;
+    if response.status != rustnt_core::service::STATUS_SUCCESS {
+        return Err(render_process_error(&response.payload));
+    }
+    let status = rustnt_core::process_control::decode_status_payload(&response.payload)
+        .map_err(|error| error.to_string())?;
+    println!("{}", render_process_status(status));
+    Ok(())
+}
+
+fn render_process_error(payload: &[u8]) -> String {
+    match rustnt_core::process_control::decode_status_payload(payload) {
+        Ok(status) => format!("process operation failed: {}", process_status_name(status)),
+        Err(_) => {
+            "process operation failed: service returned an invalid error response".to_string()
+        }
+    }
+}
+
+fn render_process_status(status: rustnt_core::process_control::ProcessStatus) -> String {
+    let detail = if matches!(
+        status,
+        rustnt_core::process_control::ProcessStatus::TerminatePending
+    ) {
+        "\ntermination accepted but is still pending; inspect the process again"
+    } else {
+        ""
+    };
+    let output = format!(
+        "RustNT Process Termination\n\nSTATUS        {}",
+        process_status_name(status)
+    );
+    format!("{output}{detail}")
+}
+
+fn process_status_name(status: rustnt_core::process_control::ProcessStatus) -> &'static str {
+    match status {
+        rustnt_core::process_control::ProcessStatus::Terminated => "TERMINATED",
+        rustnt_core::process_control::ProcessStatus::TerminatePending => "TERMINATE_PENDING",
+        rustnt_core::process_control::ProcessStatus::TargetNotFound => "TARGET_NOT_FOUND",
+        rustnt_core::process_control::ProcessStatus::TargetAccessDenied => "TARGET_ACCESS_DENIED",
+        rustnt_core::process_control::ProcessStatus::PidReused => "PID_REUSED",
+        rustnt_core::process_control::ProcessStatus::TargetNotOwned => "TARGET_NOT_OWNED",
+        rustnt_core::process_control::ProcessStatus::TargetProtected => "TARGET_PROTECTED",
+        rustnt_core::process_control::ProcessStatus::CallerNotElevated => "CALLER_NOT_ELEVATED",
+        rustnt_core::process_control::ProcessStatus::CallerNotAdmin => "CALLER_NOT_ADMIN",
+        rustnt_core::process_control::ProcessStatus::AccessDenied => "ACCESS_DENIED",
+    }
+}
+
+fn render_process_inspection(
+    inspection: &rustnt_core::process_control::ProcessInspection,
+) -> String {
+    format!(
+        "RustNT Process Inspection\n\nPID           {}\nCREATION      {}\nIMAGE         {}\nPATH          {}\nTHREADS       {}\nMEMORY        {}\nOWNER SID     {}",
+        inspection.pid,
+        inspection.creation_time_100ns,
+        inspection.image_name,
+        inspection.image_path.as_deref().unwrap_or("N/A"),
+        inspection.thread_count,
+        inspection
+            .memory_bytes
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "N/A".to_string()),
+        inspection.owner_sid
+    )
 }
 
 fn print_service_usage() {
@@ -463,8 +626,9 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_bytes, matches_filter, parse_options, parse_service_command, render_identity,
-        render_processes, sort_processes, ServiceCommand, SortKey,
+        format_bytes, matches_filter, parse_options, parse_process_command, parse_service_command,
+        render_identity, render_process_inspection, render_process_status, render_processes,
+        sort_processes, ProcessCommand, ServiceCommand, SortKey,
     };
 
     #[test]
@@ -519,6 +683,67 @@ mod tests {
         assert!(parse_options(&strings(&["--sort", "pid", "--sort", "name"])).is_err());
         assert!(parse_options(&strings(&["--filter", "--sort"])).is_err());
         assert!(parse_options(&strings(&["--unknown"])).is_err());
+    }
+
+    #[test]
+    fn parses_inspect_and_terminate_with_positive_decimal_pid() {
+        assert_eq!(
+            parse_process_command(&strings(&["inspect", "--pid", "42"]))
+                .expect("inspect should parse"),
+            ProcessCommand::Inspect { pid: 42 }
+        );
+        assert_eq!(
+            parse_process_command(&strings(&["terminate", "--pid", "42"]))
+                .expect("terminate should parse"),
+            ProcessCommand::Terminate { pid: 42 }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_process_command_pid_and_arguments() {
+        for args in [
+            vec!["inspect"],
+            vec!["inspect", "--pid"],
+            vec!["inspect", "--pid", "0"],
+            vec!["inspect", "--pid", "-1"],
+            vec!["inspect", "--pid", "not-a-pid"],
+            vec!["inspect", "--pid", "42", "--extra"],
+            vec!["terminate", "--name", "demo.exe"],
+            vec!["terminate", "--pid", "42", "--force"],
+            vec!["unknown", "--pid", "42"],
+        ] {
+            assert!(
+                parse_process_command(&strings(&args)).is_err(),
+                "expected rejection for {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn renders_bounded_inspection_fields_without_unlisted_metadata() {
+        let inspection = rustnt_core::process_control::ProcessInspection {
+            pid: 42,
+            creation_time_100ns: 1234,
+            image_name: "demo.exe".to_string(),
+            image_path: Some(r"C:\Apps\demo.exe".to_string()),
+            thread_count: 3,
+            memory_bytes: Some(4096),
+            owner_sid: "S-1-5-21-user".to_string(),
+        };
+        let output = render_process_inspection(&inspection);
+        assert!(output.contains("PID           42"));
+        assert!(output.contains("CREATION      1234"));
+        assert!(output.contains("OWNER SID     S-1-5-21-user"));
+        assert!(!output.contains("COMMAND_LINE"));
+        assert!(!output.contains("TOKEN"));
+    }
+
+    #[test]
+    fn renders_pending_termination_with_reinspect_instruction() {
+        let output =
+            render_process_status(rustnt_core::process_control::ProcessStatus::TerminatePending);
+        assert!(output.contains("TERMINATE_PENDING"));
+        assert!(output.contains("inspect the process again"));
     }
 
     #[test]
