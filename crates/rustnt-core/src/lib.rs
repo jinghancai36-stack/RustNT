@@ -1,5 +1,6 @@
 #![cfg(windows)]
 
+pub mod process_control;
 pub mod service;
 
 use std::collections::HashMap;

@@ -542,6 +542,8 @@ pub enum Command {
     Ping,
     Identity,
     Capabilities,
+    ProcessInspect,
+    ProcessTerminate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -679,6 +681,8 @@ fn command_code(command: Command) -> u16 {
         Command::Ping => 0,
         Command::Identity => 1,
         Command::Capabilities => 2,
+        Command::ProcessInspect => 3,
+        Command::ProcessTerminate => 4,
     }
 }
 
@@ -687,6 +691,8 @@ fn command_from_code(code: u16) -> Result<Command, ServiceError> {
         0 => Ok(Command::Ping),
         1 => Ok(Command::Identity),
         2 => Ok(Command::Capabilities),
+        3 => Ok(Command::ProcessInspect),
+        4 => Ok(Command::ProcessTerminate),
         _ => Err(ServiceError::protocol(
             "decode request",
             format!("unknown command {code}"),
@@ -938,6 +944,8 @@ pub fn collect_identity() -> Result<ServiceIdentity, ServiceError> {
             "ping".to_string(),
             "identity".to_string(),
             "capabilities".to_string(),
+            "process_inspect".to_string(),
+            "process_terminate".to_string(),
         ],
     })
 }
@@ -965,8 +973,14 @@ fn dispatch_command(command: Command) -> Response {
         },
         Command::Capabilities => Response {
             status: STATUS_SUCCESS,
-            payload: b"ping,identity,capabilities\n".to_vec(),
+            payload: b"ping,identity,capabilities,process_inspect,process_terminate\n".to_vec(),
         },
+        Command::ProcessInspect | Command::ProcessTerminate => {
+            request_error_response(ServiceError::protocol(
+                "dispatch command",
+                "process-control dispatch is not connected yet",
+            ))
+        }
     }
 }
 
@@ -2061,7 +2075,29 @@ mod tests {
         assert!(
             String::from_utf8(super::dispatch_command(Command::Capabilities).payload)
                 .expect("capabilities should be UTF-8")
-                .contains("ping,identity,capabilities")
+                .contains("ping,identity,capabilities,process_inspect,process_terminate")
+        );
+    }
+
+    #[test]
+    fn capability_response_contains_only_the_fixed_five_command_names() {
+        assert_eq!(
+            super::dispatch_command(Command::Capabilities).payload,
+            b"ping,identity,capabilities,process_inspect,process_terminate\n"
+        );
+    }
+
+    #[test]
+    fn process_commands_have_stable_protocol_codes() {
+        assert_eq!(super::command_code(Command::ProcessInspect), 3);
+        assert_eq!(super::command_code(Command::ProcessTerminate), 4);
+        assert_eq!(
+            super::command_from_code(3).expect("inspect command should decode"),
+            Command::ProcessInspect
+        );
+        assert_eq!(
+            super::command_from_code(4).expect("terminate command should decode"),
+            Command::ProcessTerminate
         );
     }
 
