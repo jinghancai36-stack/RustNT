@@ -4,6 +4,7 @@ members = [
     "crates/rustnt-cli",
     "crates/rustnt-bench",
     "crates/rustnt-service",
+    "crates/rustnt-task09-target",
 ]
 resolver = "2"
 
