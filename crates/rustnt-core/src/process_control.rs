@@ -158,8 +158,11 @@ use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_ME
 use windows_sys::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, TerminateProcess,
     WaitForSingleObject, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, PROCESS_VM_READ,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
+
+#[cfg(windows)]
+const INSPECT_PROCESS_ACCESS: u32 = PROCESS_QUERY_LIMITED_INFORMATION;
 
 #[cfg(windows)]
 struct OwnedHandle(HANDLE);
@@ -422,7 +425,7 @@ pub(crate) fn inspect_process(
     }
     let handle = unsafe {
         // SAFETY: pid is used only as a process identifier; the returned handle is checked.
-        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, 0, pid)
+        OpenProcess(INSPECT_PROCESS_ACCESS, 0, pid)
     };
     if handle.is_null() || handle == INVALID_HANDLE_VALUE {
         return Err(target_open_error("open target process"));
@@ -851,6 +854,15 @@ mod tests {
                 status
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn inspect_uses_query_only_process_access() {
+        assert_eq!(
+            super::INSPECT_PROCESS_ACCESS,
+            windows_sys::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION
+        );
     }
 
     fn policy_input(

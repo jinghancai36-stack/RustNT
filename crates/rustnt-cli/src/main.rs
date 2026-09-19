@@ -123,15 +123,15 @@ fn run_process_command(command: ProcessCommand) -> Result<(), String> {
 
 fn ensure_service_running() -> Result<(), String> {
     let status = rustnt_core::service::query_service_status().map_err(|error| error.to_string())?;
-    if matches!(
-        status.state,
-        rustnt_core::service::ServiceState::NotInstalled
-            | rustnt_core::service::ServiceState::Stopped
-    ) {
+    if !service_state_is_ready(status.state) {
         Err("service is not running; run rustnt service start".to_string())
     } else {
         Ok(())
     }
+}
+
+fn service_state_is_ready(state: rustnt_core::service::ServiceState) -> bool {
+    matches!(state, rustnt_core::service::ServiceState::Running)
 }
 
 fn request_process(
@@ -628,7 +628,7 @@ mod tests {
     use super::{
         format_bytes, matches_filter, parse_options, parse_process_command, parse_service_command,
         render_identity, render_process_inspection, render_process_status, render_processes,
-        sort_processes, ProcessCommand, ServiceCommand, SortKey,
+        service_state_is_ready, sort_processes, ProcessCommand, ServiceCommand, SortKey,
     };
 
     #[test]
@@ -744,6 +744,22 @@ mod tests {
             render_process_status(rustnt_core::process_control::ProcessStatus::TerminatePending);
         assert!(output.contains("TERMINATE_PENDING"));
         assert!(output.contains("inspect the process again"));
+    }
+
+    #[test]
+    fn process_commands_require_the_service_to_be_running() {
+        assert!(service_state_is_ready(
+            rustnt_core::service::ServiceState::Running
+        ));
+        for state in [
+            rustnt_core::service::ServiceState::NotInstalled,
+            rustnt_core::service::ServiceState::Stopped,
+            rustnt_core::service::ServiceState::StartPending,
+            rustnt_core::service::ServiceState::StopPending,
+            rustnt_core::service::ServiceState::Other(999),
+        ] {
+            assert!(!service_state_is_ready(state));
+        }
     }
 
     #[test]
