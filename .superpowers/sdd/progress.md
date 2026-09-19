@@ -46,3 +46,8 @@
   complete; implementation commits are recorded in
   `.superpowers/sdd/task-8-report.md`; elevated checks are explicitly
   documented as environment-gated because the current token is not elevated.
+- Task 09 disposable target and automated preflight: complete; the helper
+  prints a PID, remains idle, and exits cleanly when interrupted. Workspace
+  verification and cleanup passed. Administrator/UAC service installation,
+  Pipe inspection, termination, rejection matrix, and uninstall remain
+  environment-gated and are recorded in `.superpowers/sdd/task-9-report.md`.
