@@ -198,7 +198,7 @@ fn run_identity_command() -> Result<(), String> {
     }
 
     let response = rustnt_core::service::ServiceClient
-        .request(rustnt_core::service::Command::Identity)
+        .request(rustnt_core::service::Command::Identity, &[])
         .map_err(|error| error.to_string())?;
     if response.status != 0 {
         return Err(format!(
