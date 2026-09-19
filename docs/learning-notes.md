@@ -105,9 +105,10 @@ service to drop that connection and return to its one-instance accept loop.
 `ACK1` is not a fourth protocol command.
 
 The decoder rejects bad magic, unsupported versions, unknown commands,
-oversized payloads, and trailing or truncated bytes. Task 03 accepts only
-`PING`, `IDENTITY`, and `CAPABILITIES`, and these commands do not accept a
-request payload.
+oversized payloads, and trailing or truncated bytes. The fixed bridge commands
+are `PING`, `IDENTITY`, `CAPABILITIES`, `PROCESS_INSPECT`, and
+`PROCESS_TERMINATE`. The first three do not accept a request payload;
+process-control commands use exact typed payloads.
 
 ## DACLs and LocalSystem risk
 
@@ -133,8 +134,32 @@ identity response also includes protocol version and the fixed capability
 list. This is an observation of the service token, not a claim that every
 client is trusted.
 
-Task 04 and Task 05 are future product-scope labels in the roadmap. The current
-Task 04/05 work only establishes the service-bridge foundation described here;
-neither process control nor administrator command execution is implemented.
-Those future scopes require explicit authorization, auditing, and operation
-restrictions and remain separate from this bridge.
+## Controlled process operations
+
+`PROCESS_QUERY_LIMITED_INFORMATION` is a read-oriented process access right.
+`PROCESS_TERMINATE` is a separate destructive right. The CLI never opens the
+target with either right for the service operation; the LocalSystem service
+does so only after validating the fixed request and the connecting client.
+
+A PID is not a stable process identity. Windows can reuse a PID after the
+original process exits, so the CLI first inspects the target and includes its
+creation time in the terminate request. The service opens the current target,
+reads its creation time again, and rejects a mismatch as `PID_REUSED`.
+
+The service impersonates the Named Pipe client to query the caller's user SID,
+elevation, and local Administrators membership. It compares the caller SID
+with the target process token's owner SID and rejects system-owned or
+cross-user targets. After collecting the caller facts, it calls
+`RevertToSelf` before using the LocalSystem service context for target process
+operations; this prevents the impersonated client context from changing the
+meaning of later service-side calls.
+
+Pipe ACLs and `PIPE_REJECT_REMOTE_CLIENTS` limit who can reach the endpoint,
+but neither is sufficient authorization for a destructive operation. The
+terminate path therefore performs token checks for every request and returns
+fixed status names without exposing target metadata on authorization failure.
+
+All process, token, Pipe, SCM, and event handles are RAII-owned. The service
+does not retain a target HANDLE after the request. Inspection output excludes
+command lines, environments, handles, token contents, and arbitrary target
+data; field values are validated before entering the bounded key-value payload.

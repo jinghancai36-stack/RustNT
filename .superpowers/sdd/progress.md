@@ -42,3 +42,7 @@
   before abandoning an unacknowledged connection.
 - Verification and privileged lifecycle results are recorded in
   `.superpowers/sdd/task-7-report.md`.
+- Task 08 implementation, review, automated verification, and manual cleanup:
+  complete; implementation commits are recorded in
+  `.superpowers/sdd/task-8-report.md`; elevated checks are explicitly
+  documented as environment-gated because the current token is not elevated.
