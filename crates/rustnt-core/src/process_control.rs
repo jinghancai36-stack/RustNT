@@ -157,8 +157,8 @@ use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_ME
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, TerminateProcess,
-    WaitForSingleObject, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
-    PROCESS_VM_READ,
+    WaitForSingleObject, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, PROCESS_VM_READ,
 };
 
 #[cfg(windows)]
@@ -465,7 +465,7 @@ pub(crate) fn terminate_process(
     let handle = unsafe {
         // SAFETY: pid is used only as an identifier; the returned handle is checked and owned.
         OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
             0,
             request.pid,
         )
