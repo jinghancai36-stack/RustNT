@@ -28,6 +28,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustnt-task09-target"
+version = "0.1.0"
+
+[[package]]
 name = "windows-sys"
 version = "0.59.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
