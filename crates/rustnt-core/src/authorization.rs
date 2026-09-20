@@ -153,7 +153,7 @@ impl AuditEvent {
     }
 }
 
-pub trait AuditSink {
+pub trait AuditSink: Send + Sync {
     fn record(&self, event: AuditEvent);
 }
 
@@ -206,6 +206,7 @@ pub struct RequestRateLimiter {
     max_requests: usize,
     window: Duration,
     requests: HashMap<String, VecDeque<Instant>>,
+    subjects: VecDeque<String>,
 }
 
 impl RequestRateLimiter {
@@ -214,6 +215,7 @@ impl RequestRateLimiter {
             max_requests,
             window,
             requests: HashMap::new(),
+            subjects: VecDeque::new(),
         }
     }
 
@@ -222,6 +224,16 @@ impl RequestRateLimiter {
     }
 
     pub fn allow_at(&mut self, subject: &str, now: Instant) -> bool {
+        self.clear_expired(now);
+        if !self.requests.contains_key(subject) {
+            while self.requests.len() >= MAX_SUBJECTS {
+                let Some(evicted) = self.subjects.pop_front() else {
+                    break;
+                };
+                self.requests.remove(&evicted);
+            }
+            self.subjects.push_back(subject.to_string());
+        }
         let requests = self.requests.entry(subject.to_string()).or_default();
         while requests
             .front()
@@ -246,14 +258,18 @@ impl RequestRateLimiter {
             }
             !requests.is_empty()
         });
+        self.subjects
+            .retain(|subject| self.requests.contains_key(subject));
     }
 }
+
+const MAX_SUBJECTS: usize = 256;
 
 #[cfg(test)]
 mod tests {
     use super::{
         authorize, AuditEvent, AuthorizationRejection, Capability, MemoryAuditSink, RequestContext,
-        RequestRateLimiter,
+        RequestRateLimiter, MAX_SUBJECTS,
     };
     use std::time::{Duration, Instant};
 
@@ -290,6 +306,48 @@ mod tests {
     }
 
     #[test]
+    fn destructive_authorization_requires_client_sid_first() {
+        let context = RequestContext {
+            request_id: 1,
+            capability: Capability::ProcessTerminate,
+            client_sid: None,
+            caller_elevated: false,
+            caller_administrator: false,
+        };
+        assert_eq!(
+            authorize(&context),
+            Err(AuthorizationRejection::MissingClientSid)
+        );
+    }
+
+    #[test]
+    fn destructive_authorization_requires_local_admin_after_elevation() {
+        let context = RequestContext {
+            request_id: 1,
+            capability: Capability::ProcessTerminate,
+            client_sid: Some("S-1-5-21-user".to_string()),
+            caller_elevated: true,
+            caller_administrator: false,
+        };
+        assert_eq!(
+            authorize(&context),
+            Err(AuthorizationRejection::CallerNotAdmin)
+        );
+    }
+
+    #[test]
+    fn readonly_authorization_does_not_require_caller_identity() {
+        let context = RequestContext {
+            request_id: 1,
+            capability: Capability::Ping,
+            client_sid: None,
+            caller_elevated: false,
+            caller_administrator: false,
+        };
+        assert_eq!(authorize(&context), Ok(()));
+    }
+
+    #[test]
     fn memory_audit_sink_keeps_only_the_newest_events() {
         let sink = MemoryAuditSink::new(2);
         sink.record(AuditEvent::success(1, Capability::Ping, None, None));
@@ -312,5 +370,16 @@ mod tests {
         assert!(limiter.allow_at("S-1-5-21-user", start + Duration::from_secs(1)));
         assert!(!limiter.allow_at("S-1-5-21-user", start + Duration::from_secs(2)));
         assert!(limiter.allow_at("S-1-5-21-user", start + Duration::from_secs(11)));
+    }
+
+    #[test]
+    fn rate_limiter_keeps_subject_state_bounded() {
+        let start = Instant::now();
+        let mut limiter = RequestRateLimiter::new(1, Duration::from_secs(10));
+        for index in 0..(MAX_SUBJECTS + 10) {
+            assert!(limiter.allow_at(&format!("S-1-5-21-{index}"), start));
+        }
+        assert!(limiter.requests.len() <= MAX_SUBJECTS);
+        assert_eq!(limiter.requests.len(), limiter.subjects.len());
     }
 }
