@@ -1,3 +1,10 @@
+use windows_sys::Win32::Storage::FileSystem::{
+    GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives,
+};
+use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+const DRIVE_FIXED: u32 = 3;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemoryInfo {
     pub total_bytes: u64,
@@ -55,9 +62,146 @@ pub struct MonitorSnapshot {
     pub process_changes: ProcessChanges,
 }
 
+pub struct MonitorSampler {
+    previous: Option<crate::ProcessSnapshot>,
+}
+
+impl Default for MonitorSampler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MonitorSampler {
+    pub fn new() -> Self {
+        Self { previous: None }
+    }
+
+    pub fn sample(&mut self) -> Result<MonitorSnapshot, crate::RustNtError> {
+        let current = crate::sample_processes()?;
+        let cpu_percent = self
+            .previous
+            .as_ref()
+            .and_then(|previous| current.system_cpu_percent_from(previous));
+        let process_changes = self
+            .previous
+            .as_ref()
+            .map(|previous| current.process_changes_from(previous))
+            .unwrap_or_default();
+        let memory = sample_memory()?;
+        let disks = sample_disks()?;
+        self.previous = Some(current);
+        Ok(MonitorSnapshot {
+            cpu_percent,
+            memory,
+            disks,
+            process_changes,
+        })
+    }
+}
+
+fn sample_memory() -> Result<MemoryInfo, crate::RustNtError> {
+    let mut status = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        // SAFETY: MEMORYSTATUSEX contains integer fields and is initialized as required by
+        // GlobalMemoryStatusEx before the call fills its output fields.
+        ..unsafe { std::mem::zeroed() }
+    };
+    let result = unsafe {
+        // SAFETY: status points to writable storage with dwLength initialized as required by
+        // the Win32 API, and the API does not retain the pointer.
+        GlobalMemoryStatusEx(&mut status)
+    };
+    if result == 0 {
+        return Err(crate::RustNtError::last("failed to read memory status"));
+    }
+    Ok(MemoryInfo {
+        total_bytes: status.ullTotalPhys,
+        available_bytes: status.ullAvailPhys,
+    })
+}
+
+fn is_fixed_drive_type(drive_type: u32) -> bool {
+    drive_type == DRIVE_FIXED
+}
+
+fn sample_disks() -> Result<Vec<DiskInfo>, crate::RustNtError> {
+    let drive_mask = unsafe {
+        // SAFETY: GetLogicalDrives has no pointer or handle arguments.
+        GetLogicalDrives()
+    };
+    if drive_mask == 0 {
+        return Err(crate::RustNtError::last(
+            "failed to enumerate logical drives",
+        ));
+    }
+
+    let mut disks = Vec::new();
+    for drive_index in 0..26u32 {
+        if drive_mask & (1u32 << drive_index) == 0 {
+            continue;
+        }
+
+        let root = vec![
+            b'A' as u16 + drive_index as u16,
+            b':' as u16,
+            b'\\' as u16,
+            0,
+        ];
+        let drive_type = unsafe {
+            // SAFETY: root is a valid null-terminated UTF-16 drive root for the duration of the
+            // call, and GetDriveTypeW does not retain it.
+            GetDriveTypeW(root.as_ptr())
+        };
+        if is_fixed_drive_type(drive_type) {
+            disks.push(sample_disk_capacity(&root));
+        }
+    }
+    disks.sort_by(|left, right| left.root.cmp(&right.root));
+    Ok(disks)
+}
+
+fn sample_disk_capacity(root: &[u16]) -> DiskInfo {
+    let root_end = root
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(root.len());
+    let root_name = String::from_utf16_lossy(&root[..root_end]);
+    let mut free_bytes_available = 0;
+    let mut total_bytes = 0;
+    let mut free_bytes = 0;
+    let result = unsafe {
+        // SAFETY: root is a valid null-terminated UTF-16 drive root and all output pointers
+        // reference writable local storage for the duration of the call.
+        GetDiskFreeSpaceExW(
+            root.as_ptr(),
+            &mut free_bytes_available,
+            &mut total_bytes,
+            &mut free_bytes,
+        )
+    };
+    if result == 0 {
+        DiskInfo {
+            root: root_name,
+            total_bytes: None,
+            free_bytes: None,
+        }
+    } else {
+        DiskInfo {
+            root: root_name,
+            total_bytes: Some(total_bytes),
+            free_bytes: Some(free_bytes),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DiskInfo, MemoryInfo};
+    use super::{is_fixed_drive_type, DiskInfo, MemoryInfo, MonitorSampler, DRIVE_FIXED};
+
+    const DRIVE_REMOVABLE: u32 = 2;
+    const DRIVE_REMOTE: u32 = 4;
+    const DRIVE_CDROM: u32 = 5;
 
     #[test]
     fn memory_used_percent_rejects_invalid_available_bytes() {
@@ -89,5 +233,41 @@ mod tests {
             .used_percent(),
             None
         );
+    }
+
+    #[test]
+    fn only_fixed_drive_types_are_selected() {
+        assert!(is_fixed_drive_type(DRIVE_FIXED));
+        assert!(!is_fixed_drive_type(DRIVE_REMOVABLE));
+        assert!(!is_fixed_drive_type(DRIVE_REMOTE));
+        assert!(!is_fixed_drive_type(DRIVE_CDROM));
+    }
+
+    #[test]
+    fn first_sampler_snapshot_has_no_cpu_or_process_events() {
+        let mut sampler = MonitorSampler::new();
+        let snapshot = sampler
+            .sample()
+            .expect("first monitor sample should succeed");
+
+        assert_eq!(snapshot.cpu_percent, None);
+        assert!(snapshot.process_changes.added.is_empty());
+        assert!(snapshot.process_changes.exited.is_empty());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn monitor_sampler_collects_two_snapshots() {
+        let mut sampler = MonitorSampler::new();
+        let first = sampler
+            .sample()
+            .expect("first monitor sample should succeed");
+        let second = sampler
+            .sample()
+            .expect("second monitor sample should succeed");
+
+        assert!(first.memory.total_bytes > 0);
+        assert!(first.memory.available_bytes <= first.memory.total_bytes);
+        assert!(second.memory.total_bytes > 0);
     }
 }
