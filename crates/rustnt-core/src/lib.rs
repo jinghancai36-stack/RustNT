@@ -137,40 +137,41 @@ impl ProcessSnapshot {
         previous: &ProcessSnapshot,
     ) -> crate::monitor::ProcessChanges {
         let mut changes = crate::monitor::ProcessChanges::default();
+        let current_by_pid: HashMap<_, _> = self
+            .processes
+            .iter()
+            .map(|process| (process.pid, process))
+            .collect();
+        let previous_by_pid: HashMap<_, _> = previous
+            .processes
+            .iter()
+            .map(|process| (process.pid, process))
+            .collect();
 
-        for current in &self.processes {
-            let Some(previous_process) = previous
-                .processes
-                .iter()
-                .find(|process| process.pid == current.pid)
-            else {
-                changes.added.push(crate::monitor::ProcessChange {
-                    pid: current.pid,
-                    name: current.name.clone(),
-                });
-                continue;
-            };
-
-            if !same_process_identity(self, previous, current.pid) {
-                changes.exited.push(crate::monitor::ProcessChange {
-                    pid: previous_process.pid,
-                    name: previous_process.name.clone(),
-                });
-                changes.added.push(crate::monitor::ProcessChange {
-                    pid: current.pid,
-                    name: current.name.clone(),
-                });
+        for (&pid, current_process) in &current_by_pid {
+            match previous_by_pid.get(&pid) {
+                None => changes.added.push(crate::monitor::ProcessChange {
+                    pid,
+                    name: current_process.name.clone(),
+                }),
+                Some(previous_process) if !same_process_identity(self, previous, pid) => {
+                    changes.exited.push(crate::monitor::ProcessChange {
+                        pid,
+                        name: previous_process.name.clone(),
+                    });
+                    changes.added.push(crate::monitor::ProcessChange {
+                        pid,
+                        name: current_process.name.clone(),
+                    });
+                }
+                Some(_) => {}
             }
         }
 
-        for previous_process in &previous.processes {
-            if self
-                .processes
-                .iter()
-                .all(|process| process.pid != previous_process.pid)
-            {
+        for (&pid, previous_process) in &previous_by_pid {
+            if !current_by_pid.contains_key(&pid) {
                 changes.exited.push(crate::monitor::ProcessChange {
-                    pid: previous_process.pid,
+                    pid,
                     name: previous_process.name.clone(),
                 });
             }
@@ -540,6 +541,44 @@ mod tests {
         assert_eq!(
             current.process_changes_from(&previous),
             ProcessChanges::default()
+        );
+    }
+
+    #[test]
+    fn process_comparison_sorts_changes_by_pid() {
+        let previous = snapshot_with_processes(&[
+            (9, "old-nine.exe", Some(90)),
+            (3, "old-three.exe", Some(30)),
+        ]);
+        let current = snapshot_with_processes(&[
+            (8, "new-eight.exe", Some(80)),
+            (2, "new-two.exe", Some(20)),
+        ]);
+
+        assert_eq!(
+            current.process_changes_from(&previous),
+            ProcessChanges {
+                added: vec![
+                    ProcessChange {
+                        pid: 2,
+                        name: "new-two.exe".to_string(),
+                    },
+                    ProcessChange {
+                        pid: 8,
+                        name: "new-eight.exe".to_string(),
+                    },
+                ],
+                exited: vec![
+                    ProcessChange {
+                        pid: 3,
+                        name: "old-three.exe".to_string(),
+                    },
+                    ProcessChange {
+                        pid: 9,
+                        name: "old-nine.exe".to_string(),
+                    },
+                ],
+            }
         );
     }
 
