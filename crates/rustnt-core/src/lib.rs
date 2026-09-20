@@ -1,6 +1,7 @@
 #![cfg(windows)]
 
 pub mod authorization;
+pub mod monitor;
 pub mod process_control;
 pub mod service;
 
@@ -64,9 +65,23 @@ struct CpuTimes {
     system_user: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SystemTimes {
+    idle: u64,
+    kernel: u64,
+    user: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcessIdentity {
+    creation_time_100ns: Option<u64>,
+}
+
 pub struct ProcessSnapshot {
     processes: Vec<ProcessInfo>,
     cpu_times: HashMap<u32, CpuTimes>,
+    system_times: SystemTimes,
+    process_identities: HashMap<u32, ProcessIdentity>,
 }
 
 impl ProcessSnapshot {
@@ -89,6 +104,98 @@ impl ProcessSnapshot {
                     })
                 });
         }
+    }
+
+    pub fn system_cpu_percent_from(&self, previous: &ProcessSnapshot) -> Option<f32> {
+        let idle_delta = self
+            .system_times
+            .idle
+            .checked_sub(previous.system_times.idle)?;
+        let kernel_delta = self
+            .system_times
+            .kernel
+            .checked_sub(previous.system_times.kernel)?;
+        let user_delta = self
+            .system_times
+            .user
+            .checked_sub(previous.system_times.user)?;
+        let total_delta = kernel_delta.checked_add(user_delta)?;
+        if total_delta == 0 {
+            return None;
+        }
+        let busy_delta = total_delta.checked_sub(idle_delta)?;
+        let percentage = (busy_delta as f64 / total_delta as f64) * 100.0;
+        if percentage.is_finite() {
+            Some(percentage.clamp(0.0, 100.0) as f32)
+        } else {
+            None
+        }
+    }
+
+    pub fn process_changes_from(
+        &self,
+        previous: &ProcessSnapshot,
+    ) -> crate::monitor::ProcessChanges {
+        let mut changes = crate::monitor::ProcessChanges::default();
+        let current_by_pid: HashMap<_, _> = self
+            .processes
+            .iter()
+            .map(|process| (process.pid, process))
+            .collect();
+        let previous_by_pid: HashMap<_, _> = previous
+            .processes
+            .iter()
+            .map(|process| (process.pid, process))
+            .collect();
+
+        for (&pid, current_process) in &current_by_pid {
+            match previous_by_pid.get(&pid) {
+                None => changes.added.push(crate::monitor::ProcessChange {
+                    pid,
+                    name: current_process.name.clone(),
+                }),
+                Some(previous_process) if !same_process_identity(self, previous, pid) => {
+                    changes.exited.push(crate::monitor::ProcessChange {
+                        pid,
+                        name: previous_process.name.clone(),
+                    });
+                    changes.added.push(crate::monitor::ProcessChange {
+                        pid,
+                        name: current_process.name.clone(),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+
+        for (&pid, previous_process) in &previous_by_pid {
+            if !current_by_pid.contains_key(&pid) {
+                changes.exited.push(crate::monitor::ProcessChange {
+                    pid,
+                    name: previous_process.name.clone(),
+                });
+            }
+        }
+
+        changes.added.sort_by_key(|change| change.pid);
+        changes.exited.sort_by_key(|change| change.pid);
+        changes
+    }
+}
+
+fn same_process_identity(current: &ProcessSnapshot, previous: &ProcessSnapshot, pid: u32) -> bool {
+    let current_creation = current
+        .process_identities
+        .get(&pid)
+        .and_then(|identity| identity.creation_time_100ns);
+    let previous_creation = previous
+        .process_identities
+        .get(&pid)
+        .and_then(|identity| identity.creation_time_100ns);
+
+    match (current_creation, previous_creation) {
+        (Some(current_creation), Some(previous_creation)) => current_creation == previous_creation,
+        _ => true,
     }
 }
 
@@ -125,7 +232,7 @@ pub fn list_processes() -> Result<Vec<ProcessInfo>, RustNtError> {
 }
 
 pub fn sample_processes() -> Result<ProcessSnapshot, RustNtError> {
-    let (system_kernel, system_user) = system_times()?;
+    let system_times = system_times()?;
     let process_snapshot = unsafe {
         // SAFETY: The flags are valid, and process ID 0 requests a system-wide snapshot.
         CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
@@ -148,17 +255,24 @@ pub fn sample_processes() -> Result<ProcessSnapshot, RustNtError> {
 
     let mut processes = Vec::new();
     let mut cpu_time_map = HashMap::new();
+    let mut process_identities = HashMap::new();
 
     loop {
         let pid = entry.th32ProcessID;
         let name = wide_string(&entry.szExeFile);
         let (memory_bytes, path, process_cpu) = process_metrics(pid);
-        let cpu_times = process_cpu.map(|(process_kernel, process_user)| CpuTimes {
+        let cpu_times = process_cpu.map(|(_, process_kernel, process_user)| CpuTimes {
             process_kernel,
             process_user,
-            system_kernel,
-            system_user,
+            system_kernel: system_times.kernel,
+            system_user: system_times.user,
         });
+        process_identities.insert(
+            pid,
+            ProcessIdentity {
+                creation_time_100ns: process_cpu.map(|(creation, _, _)| creation),
+            },
+        );
         processes.push(ProcessInfo {
             pid,
             name,
@@ -183,10 +297,12 @@ pub fn sample_processes() -> Result<ProcessSnapshot, RustNtError> {
     Ok(ProcessSnapshot {
         processes,
         cpu_times: cpu_time_map,
+        system_times,
+        process_identities,
     })
 }
 
-fn system_times() -> Result<(u64, u64), RustNtError> {
+fn system_times() -> Result<SystemTimes, RustNtError> {
     let mut idle = FILETIME {
         dwLowDateTime: 0,
         dwHighDateTime: 0,
@@ -207,11 +323,17 @@ fn system_times() -> Result<(u64, u64), RustNtError> {
     if result == 0 {
         Err(RustNtError::last("failed to read system times"))
     } else {
-        Ok((filetime_to_u64(kernel), filetime_to_u64(user)))
+        Ok(SystemTimes {
+            idle: filetime_to_u64(idle),
+            kernel: filetime_to_u64(kernel),
+            user: filetime_to_u64(user),
+        })
     }
 }
 
-fn process_metrics(pid: u32) -> (Option<u64>, Option<String>, Option<(u64, u64)>) {
+type ProcessMetrics = (Option<u64>, Option<String>, Option<(u64, u64, u64)>);
+
+fn process_metrics(pid: u32) -> ProcessMetrics {
     let handle = unsafe {
         // SAFETY: pid comes from the system snapshot; the requested rights are read-only query
         // rights. A null handle is handled as an unavailable metric.
@@ -269,7 +391,7 @@ fn process_path(handle: HANDLE) -> Option<String> {
     }
 }
 
-fn process_times(handle: HANDLE) -> Option<(u64, u64)> {
+fn process_times(handle: HANDLE) -> Option<(u64, u64, u64)> {
     let mut creation = FILETIME {
         dwLowDateTime: 0,
         dwHighDateTime: 0,
@@ -294,7 +416,11 @@ fn process_times(handle: HANDLE) -> Option<(u64, u64)> {
     if result == 0 {
         None
     } else {
-        Some((filetime_to_u64(kernel), filetime_to_u64(user)))
+        Some((
+            filetime_to_u64(creation),
+            filetime_to_u64(kernel),
+            filetime_to_u64(user),
+        ))
     }
 }
 
@@ -335,7 +461,126 @@ fn wide_string(value: &[u16]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{calculate_cpu_percent, list_processes, sample_processes, CpuTimes};
+    use std::collections::HashMap;
+
+    use super::{
+        calculate_cpu_percent, list_processes, sample_processes, CpuTimes, ProcessIdentity,
+        ProcessInfo, ProcessSnapshot, SystemTimes,
+    };
+    use crate::monitor::{ProcessChange, ProcessChanges};
+
+    #[test]
+    fn system_cpu_percentage_uses_busy_delta_over_total_delta() {
+        let previous = system_snapshot(100, 1_000, 2_000);
+        let current = system_snapshot(200, 2_000, 3_000);
+
+        assert_eq!(current.system_cpu_percent_from(&previous), Some(95.0));
+    }
+
+    #[test]
+    fn system_cpu_percentage_is_unavailable_for_backwards_or_zero_deltas() {
+        let previous = system_snapshot(100, 1_000, 2_000);
+
+        assert_eq!(
+            system_snapshot(100, 1_000, 2_000).system_cpu_percent_from(&previous),
+            None
+        );
+        assert_eq!(
+            system_snapshot(50, 1_000, 2_000).system_cpu_percent_from(&previous),
+            None
+        );
+    }
+
+    #[test]
+    fn first_process_comparison_reports_added_and_exited_processes() {
+        let previous = snapshot_with_processes(&[(7, "old.exe", Some(10))]);
+        let current = snapshot_with_processes(&[(8, "new.exe", Some(20))]);
+
+        assert_eq!(
+            current.process_changes_from(&previous),
+            ProcessChanges {
+                added: vec![ProcessChange {
+                    pid: 8,
+                    name: "new.exe".to_string(),
+                }],
+                exited: vec![ProcessChange {
+                    pid: 7,
+                    name: "old.exe".to_string(),
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn process_comparison_reports_pid_reuse_as_exit_and_addition() {
+        let previous = snapshot_with_processes(&[(7, "old.exe", Some(10))]);
+        let current = snapshot_with_processes(&[(7, "new.exe", Some(20))]);
+
+        let changes = current.process_changes_from(&previous);
+
+        assert_eq!(
+            changes,
+            ProcessChanges {
+                added: vec![ProcessChange {
+                    pid: 7,
+                    name: "new.exe".to_string(),
+                }],
+                exited: vec![ProcessChange {
+                    pid: 7,
+                    name: "old.exe".to_string(),
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn process_comparison_falls_back_to_pid_when_creation_time_is_missing() {
+        let previous = snapshot_with_processes(&[(7, "old.exe", None)]);
+        let current = snapshot_with_processes(&[(7, "new.exe", Some(20))]);
+
+        assert_eq!(
+            current.process_changes_from(&previous),
+            ProcessChanges::default()
+        );
+    }
+
+    #[test]
+    fn process_comparison_sorts_changes_by_pid() {
+        let previous = snapshot_with_processes(&[
+            (9, "old-nine.exe", Some(90)),
+            (3, "old-three.exe", Some(30)),
+        ]);
+        let current = snapshot_with_processes(&[
+            (8, "new-eight.exe", Some(80)),
+            (2, "new-two.exe", Some(20)),
+        ]);
+
+        assert_eq!(
+            current.process_changes_from(&previous),
+            ProcessChanges {
+                added: vec![
+                    ProcessChange {
+                        pid: 2,
+                        name: "new-two.exe".to_string(),
+                    },
+                    ProcessChange {
+                        pid: 8,
+                        name: "new-eight.exe".to_string(),
+                    },
+                ],
+                exited: vec![
+                    ProcessChange {
+                        pid: 3,
+                        name: "old-three.exe".to_string(),
+                    },
+                    ProcessChange {
+                        pid: 9,
+                        name: "old-nine.exe".to_string(),
+                    },
+                ],
+            }
+        );
+    }
 
     #[test]
     fn cpu_percentage_uses_process_delta_over_system_delta() {
@@ -414,5 +659,57 @@ mod tests {
             super::wide_string(&[b'R' as u16, b'u' as u16, 0, b'x' as u16]),
             "Ru"
         );
+    }
+
+    fn system_snapshot(idle: u64, kernel: u64, user: u64) -> ProcessSnapshot {
+        ProcessSnapshot {
+            processes: Vec::new(),
+            cpu_times: HashMap::new(),
+            system_times: SystemTimes { idle, kernel, user },
+            process_identities: HashMap::new(),
+        }
+    }
+
+    fn snapshot_with_processes(processes: &[(u32, &str, Option<u64>)]) -> ProcessSnapshot {
+        let mut process_rows = Vec::new();
+        let mut cpu_times = HashMap::new();
+        let mut process_identities = HashMap::new();
+
+        for (pid, name, creation_time_100ns) in processes {
+            process_rows.push(ProcessInfo {
+                pid: *pid,
+                name: (*name).to_string(),
+                thread_count: 1,
+                memory_bytes: None,
+                path: None,
+                cpu_percent: None,
+            });
+            cpu_times.insert(
+                *pid,
+                CpuTimes {
+                    process_kernel: 10,
+                    process_user: 20,
+                    system_kernel: 1_000,
+                    system_user: 2_000,
+                },
+            );
+            process_identities.insert(
+                *pid,
+                ProcessIdentity {
+                    creation_time_100ns: *creation_time_100ns,
+                },
+            );
+        }
+
+        ProcessSnapshot {
+            processes: process_rows,
+            cpu_times,
+            system_times: SystemTimes {
+                idle: 100,
+                kernel: 1_000,
+                user: 2_000,
+            },
+            process_identities,
+        }
     }
 }
