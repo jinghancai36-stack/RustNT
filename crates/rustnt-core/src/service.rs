@@ -1,5 +1,9 @@
 use std::fmt;
 
+use crate::authorization::{
+    authorize, AuditEvent, AuditReason, AuthorizationRejection, Capability, MemoryAuditSink,
+    RequestContext, RequestRateLimiter,
+};
 use crate::process_control::{
     decode_inspect_request, decode_terminate_request, encode_inspection_payload,
     encode_status_payload, inspect_process, terminate_process, CallerSecurity, ProcessControlError,
@@ -556,6 +560,18 @@ pub enum Command {
     ProcessTerminate,
 }
 
+impl Command {
+    pub const fn capability(self) -> Capability {
+        match self {
+            Self::Ping => Capability::Ping,
+            Self::Identity => Capability::Identity,
+            Self::Capabilities => Capability::Capabilities,
+            Self::ProcessInspect => Capability::ProcessInspect,
+            Self::ProcessTerminate => Capability::ProcessTerminate,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
     pub command: Command,
@@ -950,13 +966,7 @@ pub fn collect_identity() -> Result<ServiceIdentity, ServiceError> {
         integrity: integrity_name(integrity_rid),
         elevated: elevation.TokenIsElevated != 0,
         protocol_version: PROTOCOL_VERSION,
-        capabilities: vec![
-            "ping".to_string(),
-            "identity".to_string(),
-            "capabilities".to_string(),
-            "process_inspect".to_string(),
-            "process_terminate".to_string(),
-        ],
+        capabilities: capability_names(),
     })
 }
 
@@ -1100,7 +1110,7 @@ fn dispatch_command(command: Command) -> Response {
         },
         Command::Capabilities => Response {
             status: STATUS_SUCCESS,
-            payload: b"ping,identity,capabilities,process_inspect,process_terminate\n".to_vec(),
+            payload: capability_payload(),
         },
         Command::ProcessInspect | Command::ProcessTerminate => {
             request_error_response(ServiceError::protocol(
@@ -1111,6 +1121,18 @@ fn dispatch_command(command: Command) -> Response {
     }
 }
 
+fn capability_payload() -> Vec<u8> {
+    let mut payload = capability_names().join(",").into_bytes();
+    payload.push(b'\n');
+    payload
+}
+
+fn capability_names() -> Vec<String> {
+    Capability::all()
+        .iter()
+        .map(|capability| capability.name().to_string())
+        .collect()
+}
 fn process_error_response(error: ProcessControlError) -> Response {
     match error {
         ProcessControlError::Status(status) => Response {
@@ -1137,12 +1159,214 @@ fn process_error_response(error: ProcessControlError) -> Response {
 }
 
 #[cfg(windows)]
-fn dispatch_request(pipe: HANDLE, request: Request) -> Response {
+struct PipeRuntime {
+    next_request_id: u64,
+    audit: MemoryAuditSink,
+    limiter: RequestRateLimiter,
+}
+
+#[cfg(windows)]
+impl PipeRuntime {
+    fn new() -> Self {
+        Self {
+            next_request_id: 1,
+            audit: MemoryAuditSink::new(256),
+            limiter: RequestRateLimiter::new(4, Duration::from_secs(10)),
+        }
+    }
+
+    fn next_request_id(&mut self) -> Result<u64, ServiceError> {
+        let request_id = self.next_request_id;
+        self.next_request_id = request_id.checked_add(1).ok_or_else(|| {
+            ServiceError::protocol("allocate request id", "request id space is exhausted")
+        })?;
+        Ok(request_id)
+    }
+
+    fn record(&self, event: AuditEvent) {
+        self.audit.record(event);
+    }
+}
+
+#[cfg(windows)]
+fn audit_reason_for_authorization(rejection: AuthorizationRejection) -> AuditReason {
+    match rejection {
+        AuthorizationRejection::MissingClientSid => AuditReason::MissingClientSid,
+        AuthorizationRejection::CallerNotElevated => AuditReason::CallerNotElevated,
+        AuthorizationRejection::CallerNotAdmin => AuditReason::CallerNotAdmin,
+    }
+}
+
+#[cfg(windows)]
+fn process_status_event(
+    request_id: u64,
+    capability: Capability,
+    status: ProcessStatus,
+    target_pid: Option<u32>,
+    client_sid: Option<String>,
+) -> AuditEvent {
+    match status {
+        ProcessStatus::Terminated | ProcessStatus::TerminatePending => {
+            AuditEvent::success(request_id, capability, target_pid, client_sid)
+        }
+        ProcessStatus::TargetNotFound => AuditEvent::rejected(
+            request_id,
+            capability,
+            AuditReason::TargetNotFound,
+            target_pid,
+            client_sid,
+        ),
+        ProcessStatus::TargetAccessDenied | ProcessStatus::AccessDenied => AuditEvent::rejected(
+            request_id,
+            capability,
+            AuditReason::AccessDenied,
+            target_pid,
+            client_sid,
+        ),
+        ProcessStatus::PidReused => AuditEvent::rejected(
+            request_id,
+            capability,
+            AuditReason::PidReused,
+            target_pid,
+            client_sid,
+        ),
+        ProcessStatus::TargetNotOwned => AuditEvent::rejected(
+            request_id,
+            capability,
+            AuditReason::TargetNotOwned,
+            target_pid,
+            client_sid,
+        ),
+        ProcessStatus::TargetProtected => AuditEvent::rejected(
+            request_id,
+            capability,
+            AuditReason::TargetProtected,
+            target_pid,
+            client_sid,
+        ),
+        ProcessStatus::CallerNotElevated => AuditEvent::rejected(
+            request_id,
+            capability,
+            AuditReason::CallerNotElevated,
+            target_pid,
+            client_sid,
+        ),
+        ProcessStatus::CallerNotAdmin => AuditEvent::rejected(
+            request_id,
+            capability,
+            AuditReason::CallerNotAdmin,
+            target_pid,
+            client_sid,
+        ),
+    }
+}
+
+#[cfg(windows)]
+fn record_process_error(
+    runtime: &PipeRuntime,
+    request_id: u64,
+    capability: Capability,
+    target_pid: Option<u32>,
+    client_sid: Option<String>,
+    error: &ProcessControlError,
+) {
+    let event = match error {
+        ProcessControlError::Status(status) => {
+            process_status_event(request_id, capability, *status, target_pid, client_sid)
+        }
+        ProcessControlError::InvalidPayload(_)
+        | ProcessControlError::InvalidField(_)
+        | ProcessControlError::OversizedPayload => AuditEvent::failed(
+            request_id,
+            capability,
+            AuditReason::MalformedPayload,
+            target_pid,
+            client_sid,
+        ),
+        ProcessControlError::Windows { .. } => AuditEvent::failed(
+            request_id,
+            capability,
+            AuditReason::WindowsFailure,
+            target_pid,
+            client_sid,
+        ),
+    };
+    runtime.record(event);
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminationGateRejection {
+    Authorization(AuthorizationRejection),
+    RateLimited,
+}
+
+#[cfg(windows)]
+fn authorize_termination(
+    runtime: &mut PipeRuntime,
+    context: &RequestContext,
+    target_pid: Option<u32>,
+) -> Result<(), TerminationGateRejection> {
+    if let Err(rejection) = authorize(context) {
+        runtime.record(AuditEvent::rejected(
+            context.request_id,
+            context.capability,
+            audit_reason_for_authorization(rejection),
+            target_pid,
+            context.client_sid.clone(),
+        ));
+        return Err(TerminationGateRejection::Authorization(rejection));
+    }
+
+    let client_sid = context
+        .client_sid
+        .as_deref()
+        .expect("destructive authorization requires a client SID");
+    if !runtime.limiter.allow(client_sid) {
+        runtime.record(AuditEvent::rejected(
+            context.request_id,
+            context.capability,
+            AuditReason::RateLimited,
+            None,
+            Some(client_sid.to_string()),
+        ));
+        return Err(TerminationGateRejection::RateLimited);
+    }
+
+    Ok(())
+}
+#[cfg(windows)]
+fn dispatch_request(pipe: HANDLE, runtime: &mut PipeRuntime, request: Request) -> Response {
+    let request_id = match runtime.next_request_id() {
+        Ok(request_id) => request_id,
+        Err(error) => return request_error_response(error),
+    };
+    let capability = request.command.capability();
+
     match request.command {
         Command::Ping | Command::Identity | Command::Capabilities => {
             if request.payload.is_empty() {
-                dispatch_command(request.command)
+                let response = dispatch_command(request.command);
+                if response.status == STATUS_SUCCESS {
+                    runtime.record(AuditEvent::success(request_id, capability, None, None));
+                } else {
+                    runtime.record(AuditEvent::failed(
+                        request_id,
+                        capability,
+                        AuditReason::WindowsFailure,
+                        None,
+                        None,
+                    ));
+                }
+                response
             } else {
+                runtime.record(AuditEvent::failed(
+                    request_id,
+                    capability,
+                    AuditReason::MalformedPayload,
+                    None,
+                    None,
+                ));
                 request_error_response(ServiceError::protocol(
                     "dispatch request",
                     "read-only service commands do not accept request payloads",
@@ -1152,46 +1376,137 @@ fn dispatch_request(pipe: HANDLE, request: Request) -> Response {
         Command::ProcessInspect => {
             let request = match decode_inspect_request(&request.payload) {
                 Ok(request) => request,
-                Err(error) => return process_error_response(error),
+                Err(error) => {
+                    record_process_error(runtime, request_id, capability, None, None, &error);
+                    return process_error_response(error);
+                }
             };
             match inspect_process(request.pid, unsafe {
                 // SAFETY: GetCurrentProcessId has no pointer or handle preconditions.
                 GetCurrentProcessId()
             }) {
                 Ok(inspection) => match encode_inspection_payload(&inspection, MAX_PAYLOAD) {
-                    Ok(payload) => Response {
-                        status: STATUS_SUCCESS,
-                        payload,
-                    },
-                    Err(error) => process_error_response(error),
+                    Ok(payload) => {
+                        runtime.record(AuditEvent::success(
+                            request_id,
+                            capability,
+                            Some(request.pid),
+                            None,
+                        ));
+                        Response {
+                            status: STATUS_SUCCESS,
+                            payload,
+                        }
+                    }
+                    Err(error) => {
+                        record_process_error(
+                            runtime,
+                            request_id,
+                            capability,
+                            Some(request.pid),
+                            None,
+                            &error,
+                        );
+                        process_error_response(error)
+                    }
                 },
-                Err(error) => process_error_response(error),
+                Err(error) => {
+                    record_process_error(
+                        runtime,
+                        request_id,
+                        capability,
+                        Some(request.pid),
+                        None,
+                        &error,
+                    );
+                    process_error_response(error)
+                }
             }
         }
         Command::ProcessTerminate => {
             let request = match decode_terminate_request(&request.payload) {
                 Ok(request) => request,
-                Err(error) => return process_error_response(error),
+                Err(error) => {
+                    record_process_error(runtime, request_id, capability, None, None, &error);
+                    return process_error_response(error);
+                }
             };
+            let target_pid = Some(request.pid);
             let caller = match query_pipe_client_security(pipe) {
                 Ok(caller) => caller,
-                Err(error) => return request_error_response(error),
+                Err(error) => {
+                    runtime.record(AuditEvent::failed(
+                        request_id,
+                        capability,
+                        AuditReason::WindowsFailure,
+                        target_pid,
+                        None,
+                    ));
+                    return request_error_response(error);
+                }
             };
+            let client_sid = Some(caller.user_sid.clone());
+            let context = RequestContext {
+                request_id,
+                capability,
+                client_sid: client_sid.clone(),
+                caller_elevated: caller.elevated,
+                caller_administrator: caller.administrator,
+            };
+            match authorize_termination(&mut *runtime, &context, target_pid) {
+                Ok(()) => {}
+                Err(TerminationGateRejection::Authorization(rejection)) => {
+                    return match rejection {
+                        AuthorizationRejection::MissingClientSid => {
+                            request_error_response(ServiceError::protocol(
+                                "authorize process termination",
+                                "caller SID is unavailable",
+                            ))
+                        }
+                        AuthorizationRejection::CallerNotElevated => process_error_response(
+                            ProcessControlError::Status(ProcessStatus::CallerNotElevated),
+                        ),
+                        AuthorizationRejection::CallerNotAdmin => process_error_response(
+                            ProcessControlError::Status(ProcessStatus::CallerNotAdmin),
+                        ),
+                    };
+                }
+                Err(TerminationGateRejection::RateLimited) => {
+                    return request_error_response(ServiceError::protocol(
+                        "authorize process termination",
+                        "request rate limit exceeded",
+                    ));
+                }
+            }
             match terminate_process(&request, &caller, unsafe {
                 // SAFETY: GetCurrentProcessId has no pointer or handle preconditions.
                 GetCurrentProcessId()
             }) {
-                Ok(status @ (ProcessStatus::Terminated | ProcessStatus::TerminatePending)) => {
-                    Response {
-                        status: STATUS_SUCCESS,
-                        payload: encode_status_payload(status),
+                Ok(status) => {
+                    runtime.record(process_status_event(
+                        request_id, capability, status, target_pid, client_sid,
+                    ));
+                    if matches!(
+                        status,
+                        ProcessStatus::Terminated | ProcessStatus::TerminatePending
+                    ) {
+                        Response {
+                            status: STATUS_SUCCESS,
+                            payload: encode_status_payload(status),
+                        }
+                    } else {
+                        Response {
+                            status: STATUS_ERROR,
+                            payload: encode_status_payload(status),
+                        }
                     }
                 }
-                Ok(status) => Response {
-                    status: STATUS_ERROR,
-                    payload: encode_status_payload(status),
-                },
-                Err(error) => process_error_response(error),
+                Err(error) => {
+                    record_process_error(
+                        runtime, request_id, capability, target_pid, client_sid, &error,
+                    );
+                    process_error_response(error)
+                }
             }
         }
     }
@@ -1819,6 +2134,7 @@ fn wait_for_pipe_connection(
 
 #[cfg(windows)]
 pub(crate) fn run_pipe_server(stop_event: HANDLE) -> Result<(), ServiceError> {
+    let mut runtime = PipeRuntime::new();
     loop {
         let mut pipe = create_pipe_instance()?;
         if !wait_for_pipe_connection(&mut pipe, stop_event)? {
@@ -1834,7 +2150,7 @@ pub(crate) fn run_pipe_server(stop_event: HANDLE) -> Result<(), ServiceError> {
             INFINITE,
         ) {
             Ok(request_size) => match decode_request(&request_buffer[..request_size]) {
-                Ok(request) => dispatch_request(pipe.get(), request),
+                Ok(request) => dispatch_request(pipe.get(), &mut runtime, request),
                 Err(error) => request_error_response(error),
             },
             Err(PipeIoError::Stopped) => return Ok(()),
@@ -2289,9 +2605,183 @@ mod tests {
         );
     }
 
+    #[test]
+    fn command_capabilities_have_one_fixed_mapping() {
+        assert_eq!(
+            super::Command::Ping.capability(),
+            crate::authorization::Capability::Ping
+        );
+        assert_eq!(
+            super::Command::Identity.capability(),
+            crate::authorization::Capability::Identity
+        );
+        assert_eq!(
+            super::Command::Capabilities.capability(),
+            crate::authorization::Capability::Capabilities
+        );
+        assert_eq!(
+            super::Command::ProcessInspect.capability(),
+            crate::authorization::Capability::ProcessInspect
+        );
+        assert_eq!(
+            super::Command::ProcessTerminate.capability(),
+            crate::authorization::Capability::ProcessTerminate
+        );
+    }
+
     #[cfg(windows)]
     fn dispatch_request_for_test(request: Request) -> Response {
-        super::dispatch_request(std::ptr::null_mut(), request)
+        let mut runtime = super::PipeRuntime::new();
+        super::dispatch_request(std::ptr::null_mut(), &mut runtime, request)
+    }
+
+    #[cfg(windows)]
+    fn dispatch_request_for_test_with_runtime(
+        runtime: &mut super::PipeRuntime,
+        request: Request,
+    ) -> Response {
+        super::dispatch_request(std::ptr::null_mut(), runtime, request)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dispatch_assigns_request_ids_and_audits_successes() {
+        let mut runtime = super::PipeRuntime::new();
+        assert_eq!(
+            dispatch_request_for_test_with_runtime(
+                &mut runtime,
+                Request {
+                    command: Command::Ping,
+                    payload: Vec::new(),
+                },
+            )
+            .status,
+            STATUS_SUCCESS
+        );
+        assert_eq!(
+            dispatch_request_for_test_with_runtime(
+                &mut runtime,
+                Request {
+                    command: Command::Ping,
+                    payload: Vec::new(),
+                },
+            )
+            .status,
+            STATUS_SUCCESS
+        );
+
+        let events = runtime.audit.snapshot();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].request_id, 1);
+        assert_eq!(events[1].request_id, 2);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.capability)
+                .collect::<Vec<_>>(),
+            vec![crate::authorization::Capability::Ping; 2]
+        );
+        assert!(events.iter().all(|event| {
+            event.outcome == crate::authorization::AuditOutcome::Succeeded && event.reason.is_none()
+        }));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn malformed_known_payload_is_audited_without_opening_a_target() {
+        let mut runtime = super::PipeRuntime::new();
+        let response = dispatch_request_for_test_with_runtime(
+            &mut runtime,
+            Request {
+                command: Command::ProcessInspect,
+                payload: vec![1, 2, 3],
+            },
+        );
+        assert_eq!(response.status, super::STATUS_ERROR);
+
+        let events = runtime.audit.snapshot();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].request_id, 1);
+        assert_eq!(
+            events[0].outcome,
+            crate::authorization::AuditOutcome::Failed
+        );
+        assert_eq!(
+            events[0].reason,
+            Some(crate::authorization::AuditReason::MalformedPayload)
+        );
+        assert_eq!(events[0].target_pid, None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn termination_authorization_is_audited_before_rate_limiting() {
+        let mut runtime = super::PipeRuntime::new();
+        let context = super::RequestContext {
+            request_id: 1,
+            capability: crate::authorization::Capability::ProcessTerminate,
+            client_sid: Some("S-1-5-21-user".to_string()),
+            caller_elevated: false,
+            caller_administrator: true,
+        };
+
+        assert_eq!(
+            super::authorize_termination(&mut runtime, &context, Some(1337)),
+            Err(super::TerminationGateRejection::Authorization(
+                crate::authorization::AuthorizationRejection::CallerNotElevated
+            ))
+        );
+        let events = runtime.audit.snapshot();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].reason,
+            Some(crate::authorization::AuditReason::CallerNotElevated)
+        );
+        assert_eq!(events[0].target_pid, Some(1337));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rate_limited_termination_is_audited_without_target_metadata() {
+        let mut runtime = super::PipeRuntime::new();
+        for request_id in 1..=4 {
+            let context = super::RequestContext {
+                request_id,
+                capability: crate::authorization::Capability::ProcessTerminate,
+                client_sid: Some("S-1-5-21-user".to_string()),
+                caller_elevated: true,
+                caller_administrator: true,
+            };
+            assert_eq!(
+                super::authorize_termination(
+                    &mut runtime,
+                    &context,
+                    Some(2000 + request_id as u32),
+                ),
+                Ok(())
+            );
+        }
+
+        let context = super::RequestContext {
+            request_id: 5,
+            capability: crate::authorization::Capability::ProcessTerminate,
+            client_sid: Some("S-1-5-21-user".to_string()),
+            caller_elevated: true,
+            caller_administrator: true,
+        };
+        assert_eq!(
+            super::authorize_termination(&mut runtime, &context, Some(2005)),
+            Err(super::TerminationGateRejection::RateLimited)
+        );
+
+        let events = runtime.audit.snapshot();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].request_id, 5);
+        assert_eq!(
+            events[0].reason,
+            Some(crate::authorization::AuditReason::RateLimited)
+        );
+        assert_eq!(events[0].target_pid, None);
     }
 
     #[cfg(windows)]
