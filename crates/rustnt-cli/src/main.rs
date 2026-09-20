@@ -6,6 +6,7 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 use std::time::Duration;
 
+use rustnt_core::monitor::{MonitorSampler, MonitorSnapshot};
 use rustnt_core::ProcessInfo;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,10 +41,33 @@ struct Options {
     sort: SortKey,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MonitorOptions {
+    watch_seconds: Option<u64>,
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("service") {
         return run_service_cli(&args[1..]);
+    }
+
+    if args.first().map(String::as_str) == Some("monitor") {
+        let options = match parse_monitor_options(&args[1..]) {
+            Ok(options) => options,
+            Err(error) => {
+                eprintln!("usage error: {error}");
+                print_usage();
+                return ExitCode::from(2);
+            }
+        };
+        return match run_monitor_command(options) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::from(1)
+            }
+        };
     }
 
     if args.first().map(String::as_str) != Some("process") {
@@ -74,8 +98,39 @@ fn print_usage() {
         "usage: rustnt process list [--watch <seconds>] [--filter <text>] \
          [--sort <pid|name|cpu|memory>]\n\
          usage: rustnt process inspect --pid <PID>\n\
-         usage: rustnt process terminate --pid <PID>"
+         usage: rustnt process terminate --pid <PID>\n\
+         usage: rustnt monitor [--watch [seconds]]"
     );
+}
+
+fn parse_monitor_options(args: &[String]) -> Result<MonitorOptions, String> {
+    let mut watch_seconds = None;
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] != "--watch" {
+            return Err(format!("unknown monitor option: {}", args[index]));
+        }
+        if watch_seconds.is_some() {
+            return Err("duplicate --watch".to_string());
+        }
+        let seconds = match args.get(index + 1) {
+            None => 1,
+            Some(value) if value.starts_with("--") => 1,
+            Some(value) => {
+                let seconds = value
+                    .parse::<u64>()
+                    .map_err(|_| "--watch requires a positive integer".to_string())?;
+                if seconds == 0 {
+                    return Err("--watch must be greater than zero".to_string());
+                }
+                index += 1;
+                seconds
+            }
+        };
+        watch_seconds = Some(seconds);
+        index += 1;
+    }
+    Ok(MonitorOptions { watch_seconds })
 }
 
 fn parse_process_command(args: &[String]) -> Result<ProcessCommand, String> {
@@ -586,6 +641,28 @@ fn run_watch(options: &Options, interval: u64) -> Result<(), Box<dyn std::error:
     }
 }
 
+fn run_monitor_command(options: MonitorOptions) -> Result<(), String> {
+    match options.watch_seconds {
+        Some(interval) => run_monitor_watch(interval).map_err(|error| error.to_string()),
+        None => {
+            let mut sampler = MonitorSampler::new();
+            let snapshot = sampler.sample().map_err(|error| error.to_string())?;
+            println!("{}", render_monitor(&snapshot));
+            Ok(())
+        }
+    }
+}
+
+fn run_monitor_watch(interval: u64) -> Result<(), Box<dyn std::error::Error>> {
+    let mut sampler = MonitorSampler::new();
+    loop {
+        let snapshot = sampler.sample()?;
+        print!("\x1B[2J\x1B[H{}", render_monitor(&snapshot));
+        io::stdout().flush()?;
+        std::thread::sleep(Duration::from_secs(interval));
+    }
+}
+
 fn truncate_text(value: &str, width: usize) -> String {
     if value.chars().count() <= width {
         return value.to_string();
@@ -623,12 +700,69 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn render_monitor(snapshot: &MonitorSnapshot) -> String {
+    let cpu = snapshot
+        .cpu_percent
+        .map(|value| format!("{value:.1}%"))
+        .unwrap_or_else(|| "N/A".to_string());
+    let memory_percent = snapshot
+        .memory
+        .used_percent()
+        .map(|value| format!("{value:.1}%"))
+        .unwrap_or_else(|| "N/A".to_string());
+    let mut output = format!(
+        "RustNT System Monitor\n\nCPU              {cpu}\nMEMORY           {} / {} ({memory_percent})\n\nDISKS\nROOT             FREE        TOTAL       USED",
+        format_bytes(snapshot.memory.used_bytes()),
+        format_bytes(snapshot.memory.total_bytes)
+    );
+
+    for disk in &snapshot.disks {
+        let free = disk
+            .free_bytes
+            .map(format_bytes)
+            .unwrap_or_else(|| "N/A".to_string());
+        let total = disk
+            .total_bytes
+            .map(format_bytes)
+            .unwrap_or_else(|| "N/A".to_string());
+        let used = disk
+            .used_percent()
+            .map(|value| format!("{value:.1}%"))
+            .unwrap_or_else(|| "N/A".to_string());
+        output.push_str(&format!(
+            "\n{:<17}{:<12}{:<12}{used}",
+            disk.root, free, total
+        ));
+    }
+
+    output.push_str("\n\nPROCESS CHANGES");
+    render_process_changes(&mut output, "NEW", &snapshot.process_changes.added);
+    render_process_changes(&mut output, "EXITED", &snapshot.process_changes.exited);
+    output
+}
+
+fn render_process_changes(
+    output: &mut String,
+    label: &str,
+    changes: &[rustnt_core::monitor::ProcessChange],
+) {
+    if changes.is_empty() {
+        output.push_str(&format!("\n{label:<17}none"));
+        return;
+    }
+    for (index, change) in changes.iter().enumerate() {
+        let label = if index == 0 { label } else { "" };
+        output.push_str(&format!("\n{label:<17}{} {}", change.pid, change.name));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        format_bytes, matches_filter, parse_options, parse_process_command, parse_service_command,
-        render_identity, render_process_inspection, render_process_status, render_processes,
-        service_state_is_ready, sort_processes, ProcessCommand, ServiceCommand, SortKey,
+        format_bytes, matches_filter, parse_monitor_options, parse_options, parse_process_command,
+        parse_service_command, render_identity, render_monitor, render_process_inspection,
+        render_process_status, render_processes, service_state_is_ready, sort_processes,
+        ProcessCommand, ServiceCommand, SortKey,
     };
 
     #[test]
@@ -661,6 +795,71 @@ mod tests {
     #[test]
     fn formats_bytes_with_binary_units() {
         assert_eq!(format_bytes(1_258_291), "1.2 MB");
+    }
+
+    #[test]
+    fn parses_monitor_with_default_one_second_watch() {
+        assert_eq!(
+            parse_monitor_options(&strings(&["--watch"]))
+                .expect("monitor watch should parse")
+                .watch_seconds,
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn parses_monitor_with_explicit_watch_interval() {
+        assert_eq!(
+            parse_monitor_options(&strings(&["--watch", "3"]))
+                .expect("monitor interval should parse")
+                .watch_seconds,
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_monitor_options() {
+        for args in [
+            vec!["--watch", "0"],
+            vec!["--watch", "-1"],
+            vec!["--watch", "not-a-number"],
+            vec!["--watch", "2", "--watch", "3"],
+            vec!["--unknown"],
+        ] {
+            assert!(parse_monitor_options(&strings(&args)).is_err());
+        }
+    }
+
+    #[test]
+    fn render_monitor_sections_and_process_changes() {
+        let snapshot = rustnt_core::monitor::MonitorSnapshot {
+            cpu_percent: None,
+            memory: rustnt_core::monitor::MemoryInfo {
+                total_bytes: 4096,
+                available_bytes: 1024,
+            },
+            disks: vec![rustnt_core::monitor::DiskInfo {
+                root: "C:\\".to_string(),
+                total_bytes: None,
+                free_bytes: None,
+            }],
+            process_changes: rustnt_core::monitor::ProcessChanges {
+                added: vec![rustnt_core::monitor::ProcessChange {
+                    pid: 42,
+                    name: "new.exe".to_string(),
+                }],
+                exited: Vec::new(),
+            },
+        };
+
+        let output = render_monitor(&snapshot);
+        assert!(output.contains("CPU"));
+        assert!(output.contains("MEMORY"));
+        assert!(output.contains("DISKS"));
+        assert!(output.contains("PROCESS CHANGES"));
+        assert!(output.contains("N/A"));
+        assert!(output.contains("42 new.exe"));
+        assert!(output.contains("EXITED           none"));
     }
 
     #[test]
