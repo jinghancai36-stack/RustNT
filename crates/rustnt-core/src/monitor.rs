@@ -169,7 +169,7 @@ fn sample_disk_capacity(root: &[u16]) -> DiskInfo {
     let root_name = String::from_utf16_lossy(&root[..root_end]);
     let mut free_bytes_available = 0;
     let mut total_bytes = 0;
-    let mut free_bytes = 0;
+    let mut _total_free_bytes = 0;
     let result = unsafe {
         // SAFETY: root is a valid null-terminated UTF-16 drive root and all output pointers
         // reference writable local storage for the duration of the call.
@@ -177,27 +177,37 @@ fn sample_disk_capacity(root: &[u16]) -> DiskInfo {
             root.as_ptr(),
             &mut free_bytes_available,
             &mut total_bytes,
-            &mut free_bytes,
+            &mut _total_free_bytes,
         )
     };
     if result == 0 {
-        DiskInfo {
-            root: root_name,
-            total_bytes: None,
-            free_bytes: None,
-        }
+        disk_info_from_capacity(root_name, None)
     } else {
-        DiskInfo {
-            root: root_name,
+        disk_info_from_capacity(root_name, Some((free_bytes_available, total_bytes)))
+    }
+}
+
+fn disk_info_from_capacity(root: String, capacity: Option<(u64, u64)>) -> DiskInfo {
+    match capacity {
+        Some((free_bytes, total_bytes)) => DiskInfo {
+            root,
             total_bytes: Some(total_bytes),
             free_bytes: Some(free_bytes),
-        }
+        },
+        None => DiskInfo {
+            root,
+            total_bytes: None,
+            free_bytes: None,
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_fixed_drive_type, DiskInfo, MemoryInfo, MonitorSampler, DRIVE_FIXED};
+    use super::{
+        disk_info_from_capacity, is_fixed_drive_type, DiskInfo, MemoryInfo, MonitorSampler,
+        DRIVE_FIXED,
+    };
 
     const DRIVE_REMOVABLE: u32 = 2;
     const DRIVE_REMOTE: u32 = 4;
@@ -241,6 +251,30 @@ mod tests {
         assert!(!is_fixed_drive_type(DRIVE_REMOVABLE));
         assert!(!is_fixed_drive_type(DRIVE_REMOTE));
         assert!(!is_fixed_drive_type(DRIVE_CDROM));
+    }
+
+    #[test]
+    fn failed_disk_capacity_retains_root_with_unavailable_fields() {
+        assert_eq!(
+            disk_info_from_capacity("Z:\\".to_string(), None),
+            DiskInfo {
+                root: "Z:\\".to_string(),
+                total_bytes: None,
+                free_bytes: None,
+            }
+        );
+    }
+
+    #[test]
+    fn successful_disk_capacity_uses_caller_available_free_bytes() {
+        assert_eq!(
+            disk_info_from_capacity("C:\\".to_string(), Some((25, 100))),
+            DiskInfo {
+                root: "C:\\".to_string(),
+                total_bytes: Some(100),
+                free_bytes: Some(25),
+            }
+        );
     }
 
     #[test]
