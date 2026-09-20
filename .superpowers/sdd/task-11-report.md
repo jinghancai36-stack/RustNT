@@ -74,5 +74,5 @@ comparison ordering, PID reuse, and PID fallback behavior.
 - `0b31ee2` - add the `rustnt monitor` CLI command.
 - `a751ef2` - fix caller-available disk free-space mapping and add conversion tests.
 
-These changes are integrated on mainline at `a551ecf`; this report and the
+These changes are integrated on mainline at `6803b5d`; this report and the
 roadmap/progress updates are the final Task11 documentation change.
