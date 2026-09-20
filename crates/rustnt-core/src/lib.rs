@@ -39,7 +39,7 @@ pub struct RustNtError {
 }
 
 impl RustNtError {
-    fn last(operation: &'static str) -> Self {
+    pub(crate) fn last(operation: &'static str) -> Self {
         let code = unsafe {
             // SAFETY: GetLastError reads the calling thread's Win32 error value and has no
             // pointer or handle preconditions.
