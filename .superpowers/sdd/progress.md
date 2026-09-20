@@ -77,3 +77,15 @@ Authorization is checked after decoding and caller-security collection but befor
 the existing process-termination policy. Known malformed payloads, authorization
 rejections, process-policy statuses, Windows failures, and rate-limit rejections
 produce typed audit events. Rate-limited events omit the unvalidated requested PID.
+
+## Task 11 System Monitor Progress
+
+- Task 1: complete (commits fd5cbe0..a40b138, review clean).
+- Task 2: complete (commits aa114c9..f56f77e, review clean).
+- Task 3: complete (commits e4dbbfa..0b31ee2, review clean).
+- Task11 system monitor v1: complete
+  - command: rustnt monitor
+  - watch: --watch and --watch <positive seconds>
+  - metrics: CPU, physical memory, local fixed disks, process additions/exits
+  - service/protocol changes: none
+  - verification: full workspace test, build, clippy, format, and diff checks
