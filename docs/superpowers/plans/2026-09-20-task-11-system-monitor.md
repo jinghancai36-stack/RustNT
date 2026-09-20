@@ -48,7 +48,7 @@ fn system_cpu_percentage_uses_busy_delta_over_total_delta() {
 
     assert_eq!(
         current.system_cpu_percent_from(&previous),
-        Some(50.0)
+        Some(95.0)
     );
 }
 
