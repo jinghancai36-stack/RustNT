@@ -125,6 +125,30 @@ operation-level authorization, input validation, and audit records. RustNT's
 current bridge exposes only read-only identity and capability information plus
 the health-check `PING` command.
 
+## Capability authorization and audit
+
+Task10 makes the operation boundary explicit. A Named Pipe ACL answers who can
+reach the service, but it does not decide whether a particular destructive
+operation is allowed. The service maps each known command to a fixed typed
+capability. Read-only capabilities can run after frame validation;
+`PROCESS_TERMINATE` additionally requires the authenticated client SID, an
+elevated token, and local Administrators membership.
+
+The order matters. The service must authorize the caller before opening a target
+process, and it must apply the per-SID limiter before invoking termination. The
+existing Task08 checks still run afterward, so elevation and Administrator
+membership are not a replacement for owner-SID, creation-time, or protected-PID
+checks.
+
+Audit data is deliberately narrower than a diagnostic log. It stores a fixed
+request ID, capability, outcome, reason, and optional validated identity fields;
+it never stores command lines, environments, token contents, arbitrary payload
+bytes, or executable arguments. The default sink keeps only 256 events in
+memory, and the limiter keeps at most 256 caller-SID subjects. Rate-limited
+events omit the requested PID because that value has not passed target policy.
+These records are not durable: a service restart discards them, and Task10 does
+not register a Windows Event Log source or add an audit query endpoint.
+
 ## Token identity
 
 A process token describes the security identity under which Windows evaluates

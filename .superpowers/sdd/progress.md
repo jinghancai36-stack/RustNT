@@ -51,3 +51,29 @@
   verification and cleanup passed. Administrator/UAC service installation,
   Pipe inspection, termination, rejection matrix, and uninstall remain
   environment-gated and are recorded in `.superpowers/sdd/task-9-report.md`.
+
+## Task 10 Capability Authorization and Audit Progress
+
+Task10 implementation is complete. The fixed capability registry now drives
+command mapping, capability rendering, identity metadata, authorization, and
+audit records without changing protocol version 1 or command codes. The service
+owns a monotonically increasing request ID, a bounded in-memory audit sink, and
+a per-SID termination limiter.
+
+Automated verification passed: 77 workspace tests, workspace build, workspace
+Clippy with `-D warnings`, formatting, and diff checks. Administrator/UAC live
+service validation remains environment-gated because the current token is Medium
+Mandatory and the Administrators group is deny-only. Details are recorded in
+`.superpowers/sdd/task-10-report.md`.
+
+## Task 10 Capability Authorization and Audit Progress
+
+Task10 design and implementation are in progress. The fixed capability registry
+now drives command mapping, capability rendering, identity metadata, and audit
+records without changing protocol version 1 or command codes. The service owns a
+request sequencer, bounded in-memory audit sink, and per-SID termination limiter.
+
+Authorization is checked after decoding and caller-security collection but before
+the existing process-termination policy. Known malformed payloads, authorization
+rejections, process-policy statuses, Windows failures, and rate-limit rejections
+produce typed audit events. Rate-limited events omit the unvalidated requested PID.
