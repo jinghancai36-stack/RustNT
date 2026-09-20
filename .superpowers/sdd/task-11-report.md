@@ -40,7 +40,7 @@ workspace root:
 
 | Command | Result |
 | --- | --- |
-| `cargo test --workspace -- --nocapture` | PASS; 92 tests passed, 0 failed; 19 CLI, 72 core, 1 Task09 target; doctests ran with 0 tests |
+| `cargo test --workspace -- --nocapture` | PASS; 94 tests passed, 0 failed; 19 CLI, 74 core, 1 Task09 target; doctests ran with 0 tests |
 | `cargo build --workspace` | PASS; workspace build finished successfully |
 | `cargo clippy --workspace --all-targets -- -D warnings` | PASS; finished with no warnings or errors |
 | `cargo fmt --all -- --check` | PASS; no formatting changes required |
@@ -48,8 +48,9 @@ workspace root:
 
 The monitor-specific tests cover option parsing, deterministic rendering,
 first-sample baselining, CPU and memory percentage edge cases, fixed-drive
-selection, disk-capacity failures, process comparison ordering, PID reuse, and
-PID fallback behavior.
+selection, Win32 disk-capacity conversion for both failure (retained root with
+unavailable fields) and success (caller-available free bytes), process
+comparison ordering, PID reuse, and PID fallback behavior.
 
 ## Known Boundaries
 
@@ -71,6 +72,7 @@ PID fallback behavior.
 - `a40b138` - fix process snapshot comparison indexing.
 - `f56f77e` - collect Windows system monitor metrics.
 - `0b31ee2` - add the `rustnt monitor` CLI command.
+- `a751ef2` - fix caller-available disk free-space mapping and add conversion tests.
 
 These changes are integrated on mainline at `a551ecf`; this report and the
 roadmap/progress updates are the final Task11 documentation change.
