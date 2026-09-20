@@ -143,6 +143,30 @@ free-form command dispatch. Each operation is explicitly named, validated,
 authorized against the connecting token, and kept connection-local on failure.
 There is still no arbitrary administrator-command or script endpoint.
 
+### Task 10 capability authorization and audit
+
+The service keeps one internal capability registry for the five protocol
+commands. `Command::capability()` maps each command to the typed capability
+used by dispatch, capability rendering, authorization, and audit records. The
+wire protocol remains version 1 with command codes 0 through 4.
+
+Known requests receive a monotonically increasing internal request ID. The
+destructive path follows this order: decode the exact typed payload, query the
+Pipe client's security facts, authorize the capability, apply the per-SID
+termination limiter, and only then call the existing Task08 process policy.
+The Task08 checks remain in `terminate_process` as defense in depth. Read-only
+commands do not require caller identity beyond transport and frame validation.
+
+The audit model is typed and bounded. Each event contains a request ID, fixed
+capability, outcome, fixed reason when applicable, and optional target PID and
+caller SID. Malformed payloads for known commands are recorded as
+`MALFORMED_PAYLOAD`; authorization and existing process-policy rejections are
+recorded as `REJECTED`; unclassified failures are `FAILED`. A rate-limited
+event deliberately omits the request PID because it has not been validated by
+the target-process policy. The runtime retains at most 256 events and at most
+256 limiter subjects in memory. There is no audit-query command or persistent
+Windows Event Log adapter in Task10.
+
 ## Task 08 controlled process management
 
 The process-control path is intentionally narrow:

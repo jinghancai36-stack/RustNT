@@ -67,6 +67,21 @@ to a caller-owned normal user process, checks the process creation timestamp
 again to reject PID reuse, and rejects PID 0, PID 4, the RustNT service,
 system-owned processes, and foreign-user processes.
 
+Task10 adds a typed authorization and audit boundary without changing protocol
+version 1 or command codes. The fixed capabilities are `ping`, `identity`,
+`capabilities`, `process_inspect`, and `process_terminate`; the service maps
+each command to exactly one capability before dispatch. Termination requests
+must pass the connecting client's SID, elevated-token, and local-Administrator
+checks before the existing ownership, PID-reuse, and protected-target policy
+runs. Only the destructive operation is rate-limited: at most 4 requests per
+caller SID in a 10-second window.
+
+The service keeps the newest 256 typed audit events in memory and bounds the
+rate-limiter subject table to 256 caller SIDs. Events contain only a request
+ID, fixed capability/outcome/reason values, and optional validated identity
+fields. They are not persisted to Windows Event Log and are not exposed through
+the Pipe protocol; restarting the service discards them.
+
 The service never accepts executable paths, process names, wildcards, command
 lines, scripts, arbitrary exit codes, or shell commands. The CLI does not
 perform elevation and does not open target processes with termination rights;
