@@ -20,6 +20,24 @@ calculates process CPU from process-time delta divided by system-time delta.
 Process paths, memory, and CPU are best-effort values; inaccessible or
 short-lived processes can show `N/A`.
 
+## Read-only filesystem commands
+
+Task12A adds five user-mode, read-only filesystem commands:
+
+```text
+rustnt fs stat --path <path>
+rustnt fs list --path <directory>
+rustnt fs space --path <path>
+rustnt fs permissions --path <path>
+rustnt fs search --path <directory> --name <text>
+```
+
+`search` is bounded to depth 16 and 1000 results. Reparse points are reported
+but never followed. `permissions` reports the raw owner, DACL, and supported
+allow/deny ACEs; it does not expand groups or calculate effective access.
+These commands use the current user token, do not elevate, and do not call the
+LocalSystem service. Protected paths can still return access denied.
+
 Longer-term experiments may cover filesystem performance, Windows Shell
 components, system monitoring, IPC, Native NT APIs, Windows services, and
 low-latency desktop components.

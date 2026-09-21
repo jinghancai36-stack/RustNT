@@ -4,10 +4,15 @@ use std::cmp::Ordering;
 use std::env;
 use std::io::{self, Write};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rustnt_core::filesystem::{
+    AllowOrDeny, FileKind, FileMetadata, FilePermissions, SearchLimits, SearchReport,
+};
 use rustnt_core::monitor::{MonitorSampler, MonitorSnapshot};
 use rustnt_core::ProcessInfo;
+use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
+use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SortKey {
@@ -32,6 +37,15 @@ enum ProcessCommand {
     List(Options),
     Inspect { pid: u32 },
     Terminate { pid: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileSystemCommand {
+    Stat { path: String },
+    List { path: String },
+    Space { path: String },
+    Permissions { path: String },
+    Search { path: String, name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +84,24 @@ fn main() -> ExitCode {
         };
     }
 
+    if args.first().map(String::as_str) == Some("fs") {
+        let command = match parse_filesystem_command(&args[1..]) {
+            Ok(command) => command,
+            Err(error) => {
+                eprintln!("usage error: {error}");
+                print_usage();
+                return ExitCode::from(2);
+            }
+        };
+        return match run_filesystem_command(command) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::from(1)
+            }
+        };
+    }
+
     if args.first().map(String::as_str) != Some("process") {
         print_usage();
         return ExitCode::from(2);
@@ -99,7 +131,12 @@ fn print_usage() {
          [--sort <pid|name|cpu|memory>]\n\
          usage: rustnt process inspect --pid <PID>\n\
          usage: rustnt process terminate --pid <PID>\n\
-         usage: rustnt monitor [--watch [seconds]]"
+         usage: rustnt monitor [--watch [seconds]]\n\
+         usage: rustnt fs stat --path <path>\n\
+         usage: rustnt fs list --path <directory>\n\
+         usage: rustnt fs space --path <path>\n\
+         usage: rustnt fs permissions --path <path>\n\
+         usage: rustnt fs search --path <directory> --name <text>"
     );
 }
 
@@ -757,12 +794,15 @@ fn render_process_changes(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        format_bytes, matches_filter, parse_monitor_options, parse_options, parse_process_command,
-        parse_service_command, render_identity, render_monitor, render_process_inspection,
-        render_process_status, render_processes, service_state_is_ready, sort_processes,
-        ProcessCommand, ServiceCommand, SortKey,
+        format_bytes, matches_filter, parse_filesystem_command, parse_monitor_options,
+        parse_options, parse_process_command, parse_service_command, render_disk_space,
+        render_file_metadata, render_identity, render_monitor, render_permissions,
+        render_process_inspection, render_process_status, render_processes, render_search,
+        service_state_is_ready, sort_processes, FileSystemCommand, ProcessCommand, ServiceCommand,
+        SortKey,
     };
 
     #[test]
@@ -993,6 +1033,123 @@ mod tests {
         assert!(output.contains("PATH"));
     }
 
+    #[test]
+    fn parses_all_filesystem_commands() {
+        assert_eq!(
+            parse_filesystem_command(&strings(&["stat", "--path", r"C:\Temp\a.txt"]))
+                .expect("stat should parse"),
+            FileSystemCommand::Stat {
+                path: r"C:\Temp\a.txt".to_string()
+            }
+        );
+        assert_eq!(
+            parse_filesystem_command(&strings(&[
+                "search", "--path", r"C:\Temp", "--name", "notes"
+            ]))
+            .expect("search should parse"),
+            FileSystemCommand::Search {
+                path: r"C:\Temp".to_string(),
+                name: "notes".to_string()
+            }
+        );
+        assert_eq!(
+            parse_filesystem_command(&strings(&["list", "--path", r"C:\Temp\folder"]))
+                .expect("list should parse"),
+            FileSystemCommand::List {
+                path: r"C:\Temp\folder".to_string()
+            }
+        );
+        assert_eq!(
+            parse_filesystem_command(&strings(&["space", "--path", r"C:\Temp\folder"]))
+                .expect("space should parse"),
+            FileSystemCommand::Space {
+                path: r"C:\Temp\folder".to_string()
+            }
+        );
+        assert_eq!(
+            parse_filesystem_command(&strings(&[
+                "permissions",
+                "--path",
+                r"C:\Temp\folder with spaces\file.txt"
+            ]))
+            .expect("permissions should parse"),
+            FileSystemCommand::Permissions {
+                path: r"C:\Temp\folder with spaces\file.txt".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_filesystem_arguments() {
+        for args in [
+            vec!["stat"],
+            vec!["list", "--path"],
+            vec!["space", "--path", "x", "--path", "y"],
+            vec!["permissions", "--unknown", "x"],
+            vec!["search", "--path", "x"],
+            vec!["search", "--path", "x", "--name", ""],
+            vec!["unknown", "--path", "x"],
+        ] {
+            assert!(
+                parse_filesystem_command(&strings(&args)).is_err(),
+                "expected rejection for {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn renders_filesystem_missing_values_and_search_summary() {
+        let output = render_file_metadata(&sample_directory_metadata_with_missing_times());
+        assert!(output.contains("TYPE              DIRECTORY"));
+        assert!(output.contains("SIZE              N/A"));
+        assert!(output.contains("CREATED           N/A"));
+
+        let output = render_search(&sample_search_report());
+        assert!(output.contains("MATCHES"));
+        assert!(output.contains("SKIPPED ACCESS"));
+        assert!(output.contains("TRUNCATED         no"));
+    }
+
+    #[test]
+    fn renders_filesystem_space_in_fixed_field_order() {
+        let output = render_disk_space(&rustnt_core::filesystem::DiskSpace {
+            root: r"C:\".to_string(),
+            free_bytes: 40,
+            total_bytes: 100,
+            available_bytes: 25,
+        });
+        let free = output.find("FREE").expect("FREE should render");
+        let available = output.find("AVAILABLE").expect("AVAILABLE should render");
+        let total = output.find("TOTAL").expect("TOTAL should render");
+        let used = output.find("USED").expect("USED should render");
+        assert!(free < available);
+        assert!(available < total);
+        assert!(total < used);
+        assert!(output.contains("USED              60.0%"));
+    }
+
+    #[test]
+    fn renders_filesystem_permissions_and_ace_rows() {
+        let output = render_permissions(&rustnt_core::filesystem::FilePermissions {
+            owner_sid: Some("S-1-5-18".to_string()),
+            dacl_present: true,
+            dacl_protected: false,
+            entries: vec![rustnt_core::filesystem::AceEntry {
+                kind: rustnt_core::filesystem::AllowOrDeny::Allow,
+                sid: "S-1-1-0".to_string(),
+                mask: 0x120089,
+                inherited: true,
+            }],
+        });
+        assert!(output.contains("OWNER SID        S-1-5-18"));
+        assert!(output.contains("DACL PRESENT     yes"));
+        assert!(output.contains("DACL PROTECTED   no"));
+        assert!(output.contains("ALLOW"));
+        assert!(output.contains("0x00120089"));
+        assert!(output.contains("S-1-1-0"));
+        assert!(output.contains("yes"));
+    }
+
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
     }
@@ -1030,4 +1187,318 @@ mod tests {
             ..process(pid, "demo.exe", None)
         }
     }
+
+    fn sample_directory_metadata_with_missing_times() -> rustnt_core::filesystem::FileMetadata {
+        rustnt_core::filesystem::FileMetadata {
+            path: r"C:\Temp".to_string(),
+            kind: rustnt_core::filesystem::FileKind::Directory,
+            size_bytes: None,
+            created: None,
+            modified: None,
+            accessed: None,
+            attributes: 0x10,
+            is_reparse_point: false,
+        }
+    }
+
+    fn sample_search_report() -> rustnt_core::filesystem::SearchReport {
+        rustnt_core::filesystem::SearchReport {
+            matches: vec![rustnt_core::filesystem::FileMetadata {
+                path: r"C:\Temp\notes.txt".to_string(),
+                kind: rustnt_core::filesystem::FileKind::File,
+                size_bytes: Some(4),
+                created: None,
+                modified: None,
+                accessed: None,
+                attributes: 0,
+                is_reparse_point: false,
+            }],
+            skipped_access: 2,
+            skipped_reparse: 1,
+            truncated: false,
+        }
+    }
+}
+
+fn parse_filesystem_command(args: &[String]) -> Result<FileSystemCommand, String> {
+    let command = args
+        .first()
+        .map(String::as_str)
+        .ok_or_else(|| "fs requires a command".to_string())?;
+    if !matches!(
+        command,
+        "stat" | "list" | "space" | "permissions" | "search"
+    ) {
+        return Err(format!("unknown fs command: {command}"));
+    }
+
+    let mut path = None;
+    let mut name = None;
+    let mut index = 1;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| format!("{flag} requires a value"))?;
+        if value.starts_with("--") || value.is_empty() {
+            return Err(format!("{flag} requires a non-empty value"));
+        }
+        match flag {
+            "--path" => {
+                if path.is_some() {
+                    return Err("duplicate --path".to_string());
+                }
+                path = Some(value.clone());
+            }
+            "--name" if command == "search" => {
+                if name.is_some() {
+                    return Err("duplicate --name".to_string());
+                }
+                name = Some(value.clone());
+            }
+            "--name" => return Err("--name is only valid for search".to_string()),
+            _ => return Err(format!("unknown fs option: {flag}")),
+        }
+        index += 2;
+    }
+
+    let path = path.ok_or_else(|| "fs command requires exactly --path <path>".to_string())?;
+    match command {
+        "stat" => Ok(FileSystemCommand::Stat { path }),
+        "list" => Ok(FileSystemCommand::List { path }),
+        "space" => Ok(FileSystemCommand::Space { path }),
+        "permissions" => Ok(FileSystemCommand::Permissions { path }),
+        "search" => Ok(FileSystemCommand::Search {
+            path,
+            name: name.ok_or_else(|| "search requires exactly --name <text>".to_string())?,
+        }),
+        _ => unreachable!("fs command was validated above"),
+    }
+}
+
+fn run_filesystem_command(command: FileSystemCommand) -> Result<(), String> {
+    match command {
+        FileSystemCommand::Stat { path } => {
+            let metadata =
+                rustnt_core::filesystem::stat_path(&path).map_err(format_filesystem_error)?;
+            println!("{}", render_file_metadata(&metadata));
+        }
+        FileSystemCommand::List { path } => {
+            let entries =
+                rustnt_core::filesystem::list_directory(&path).map_err(format_filesystem_error)?;
+            println!("{}", render_directory_entries(&entries));
+        }
+        FileSystemCommand::Space { path } => {
+            let space =
+                rustnt_core::filesystem::disk_space(&path).map_err(format_filesystem_error)?;
+            println!("{}", render_disk_space(&space));
+        }
+        FileSystemCommand::Permissions { path } => {
+            let permissions = rustnt_core::filesystem::read_permissions(&path)
+                .map_err(format_filesystem_error)?;
+            println!("{}", render_permissions(&permissions));
+        }
+        FileSystemCommand::Search { path, name } => {
+            let report = rustnt_core::filesystem::search_path(
+                &path,
+                &name,
+                SearchLimits {
+                    max_depth: 16,
+                    max_results: 1000,
+                },
+            )
+            .map_err(format_filesystem_error)?;
+            println!("{}", render_search(&report));
+        }
+    }
+    Ok(())
+}
+
+fn format_filesystem_error(error: rustnt_core::filesystem::FileSystemError) -> String {
+    match error {
+        rustnt_core::filesystem::FileSystemError::InvalidPath(path) => {
+            format!("invalid path: {path}")
+        }
+        rustnt_core::filesystem::FileSystemError::NotFound(path) => {
+            format!("path not found: {path}")
+        }
+        rustnt_core::filesystem::FileSystemError::AccessDenied(path) => {
+            format!("access denied: {path}")
+        }
+        rustnt_core::filesystem::FileSystemError::Io(message) => format!("I/O error: {message}"),
+        rustnt_core::filesystem::FileSystemError::Win32 { operation, code } => {
+            format!("{operation}: Windows error {code}")
+        }
+    }
+}
+
+fn file_kind_name(kind: &FileKind) -> &'static str {
+    match kind {
+        FileKind::File => "FILE",
+        FileKind::Directory => "DIRECTORY",
+        FileKind::ReparsePoint => "REPARSE",
+        FileKind::Other => "OTHER",
+    }
+}
+
+fn final_path_component(path: &str) -> &str {
+    path.rsplit(['\\', '/']).next().unwrap_or(path)
+}
+
+fn format_optional_bytes(value: Option<u64>) -> String {
+    value.map(format_bytes).unwrap_or_else(|| "N/A".to_string())
+}
+
+fn format_filetime(value: Option<SystemTime>) -> String {
+    value
+        .and_then(format_local_system_time)
+        .unwrap_or_else(|| "N/A".to_string())
+}
+
+fn format_local_system_time(value: SystemTime) -> Option<String> {
+    const WINDOWS_EPOCH_OFFSET_100NS: u128 = 116_444_736_000_000_000;
+    let elapsed = value.duration_since(UNIX_EPOCH).ok()?;
+    let ticks = elapsed
+        .as_nanos()
+        .checked_div(100)?
+        .checked_add(WINDOWS_EPOCH_OFFSET_100NS)?;
+    let ticks = u64::try_from(ticks).ok()?;
+    let file_time = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    let mut utc = SYSTEMTIME {
+        ..unsafe { std::mem::zeroed() }
+    };
+    let ok = unsafe {
+        // SAFETY: file_time points to a valid FILETIME and utc points to writable storage.
+        FileTimeToSystemTime(&file_time, &mut utc)
+    };
+    if ok == 0 {
+        return None;
+    }
+    let mut local = SYSTEMTIME {
+        ..unsafe { std::mem::zeroed() }
+    };
+    let ok = unsafe {
+        // SAFETY: utc points to a valid SYSTEMTIME and local points to writable storage.
+        SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc, &mut local)
+    };
+    if ok == 0 {
+        return None;
+    }
+    Some(format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute, local.wSecond
+    ))
+}
+
+fn render_file_metadata(metadata: &FileMetadata) -> String {
+    format!(
+        "PATH              {}\nTYPE              {}\nATTRIBUTES        0x{:08X}\nSIZE              {}\nCREATED           {}\nMODIFIED          {}\nACCESSED          {}\nREPARSE POINT     {}",
+        metadata.path,
+        file_kind_name(&metadata.kind),
+        metadata.attributes,
+        format_optional_bytes(metadata.size_bytes),
+        format_filetime(metadata.created),
+        format_filetime(metadata.modified),
+        format_filetime(metadata.accessed),
+        if metadata.is_reparse_point { "yes" } else { "no" }
+    )
+}
+
+fn render_directory_entries(entries: &[rustnt_core::filesystem::DirectoryEntry]) -> String {
+    let mut output = String::from("TYPE        SIZE        NAME");
+    for entry in entries {
+        let size = if entry.metadata.is_reparse_point || entry.metadata.kind == FileKind::Directory
+        {
+            "N/A".to_string()
+        } else {
+            format_optional_bytes(entry.metadata.size_bytes)
+        };
+        output.push_str(&format!(
+            "\n{:<11}{:<12}{}",
+            file_kind_name(&entry.metadata.kind),
+            size,
+            final_path_component(&entry.metadata.path)
+        ));
+    }
+    output
+}
+
+fn render_disk_space(space: &rustnt_core::filesystem::DiskSpace) -> String {
+    let used = if space.total_bytes == 0 || space.free_bytes > space.total_bytes {
+        "N/A".to_string()
+    } else {
+        let used_bytes = space.total_bytes - space.free_bytes;
+        format!(
+            "{:.1}%",
+            (used_bytes as f64 / space.total_bytes as f64) * 100.0
+        )
+    };
+    format!(
+        "ROOT              {}\nFREE              {}\nAVAILABLE         {}\nTOTAL             {}\nUSED              {}",
+        space.root,
+        format_bytes(space.free_bytes),
+        format_bytes(space.available_bytes),
+        format_bytes(space.total_bytes),
+        used
+    )
+}
+
+fn render_permissions(permissions: &FilePermissions) -> String {
+    let mut output = format!(
+        "{:<17}{}\n{:<17}{}\n{:<17}{}",
+        "OWNER SID",
+        permissions.owner_sid.as_deref().unwrap_or("N/A"),
+        "DACL PRESENT",
+        if permissions.dacl_present {
+            "yes"
+        } else {
+            "no"
+        },
+        "DACL PROTECTED",
+        if permissions.dacl_protected {
+            "yes"
+        } else {
+            "no"
+        },
+    );
+    output.push_str("\n\nTYPE      SID              MASK          INHERITED");
+    for entry in &permissions.entries {
+        let kind = match entry.kind {
+            AllowOrDeny::Allow => "ALLOW",
+            AllowOrDeny::Deny => "DENY",
+        };
+        output.push_str(&format!(
+            "\n{:<10}{:<17} 0x{:08X}    {}",
+            kind,
+            entry.sid,
+            entry.mask,
+            if entry.inherited { "yes" } else { "no" }
+        ));
+    }
+    output
+}
+
+fn render_search(report: &SearchReport) -> String {
+    let mut output = report
+        .matches
+        .iter()
+        .map(|metadata| metadata.path.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if output.is_empty() {
+        output.push('\n');
+    } else {
+        output.push_str("\n\n");
+    }
+    output.push_str(&format!(
+        "MATCHES             {}\nSKIPPED ACCESS      {}\nSKIPPED REPARSE     {}\nTRUNCATED         {}",
+        report.matches.len(),
+        report.skipped_access,
+        report.skipped_reparse,
+        if report.truncated { "yes" } else { "no" }
+    ));
+    output
 }
