@@ -89,3 +89,17 @@ produce typed audit events. Rate-limited events omit the unvalidated requested P
   - metrics: CPU, physical memory, local fixed disks, process additions/exits
   - service/protocol changes: none
   - verification: full workspace test, build, clippy, format, and diff checks
+
+## Task 12A Filesystem Readonly Access
+
+- Task 1: complete (commits b814e81..afd89d8, review clean).
+  - Added Windows-only filesystem metadata models, path normalization, Win32 error mapping, FILETIME conversion, and stat_path.
+  - Verification: focused 4 tests and rustnt-core 78 tests passed.
+
+- Task 2: implementation complete (commits afd89d8..6637523). Focused 8 tests, rustnt-core 82 tests, Clippy, format, and diff checks passed. Formal reviewer stream failed twice due service request limits; local equivalent review found no blocking issue. Formal review remains to be backfilled when agent capacity recovers.
+
+- Task 3: complete (commits 06f3630..eeb5884, review clean). Added raw owner/DACL/ACE reading with Win32 resource guards; focused ACL tests, 85 rustnt-core tests, Clippy, and formatting passed.
+
+- Task 4: complete (commit 5ada19e, review clean). Added `rustnt fs` CLI
+  integration, documentation, and the Task12A verification report. CLI and
+  workspace verification passed; independent review approved the implementation.
