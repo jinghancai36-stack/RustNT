@@ -1,6 +1,7 @@
 #![cfg(windows)]
 
 pub mod authorization;
+pub mod filesystem;
 pub mod monitor;
 pub mod process_control;
 pub mod service;
