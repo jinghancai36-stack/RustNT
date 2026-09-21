@@ -181,8 +181,8 @@ fn map_ace_type(ace_type: u32) -> Result<AllowOrDeny, FileSystemError> {
     match ace_type {
         ACCESS_ALLOWED_ACE_TYPE => Ok(AllowOrDeny::Allow),
         ACCESS_DENIED_ACE_TYPE => Ok(AllowOrDeny::Deny),
-        other => Err(FileSystemError::Win32 {
-            operation: format!("read supported file ACE type {other}"),
+        _ => Err(FileSystemError::Win32 {
+            operation: "read supported file ACE".to_string(),
             code: ERROR_INVALID_DATA,
         }),
     }
@@ -786,7 +786,13 @@ mod tests {
             map_ace_type(ACCESS_DENIED_ACE_TYPE).unwrap(),
             AllowOrDeny::Deny
         );
-        assert!(map_ace_type(0x7f).is_err());
+        assert_eq!(
+            map_ace_type(0x7f),
+            Err(FileSystemError::Win32 {
+                operation: "read supported file ACE".to_string(),
+                code: windows_sys::Win32::Foundation::ERROR_INVALID_DATA,
+            })
+        );
     }
 
     #[test]
