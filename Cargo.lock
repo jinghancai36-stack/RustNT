@@ -11,6 +11,7 @@ name = "rustnt-cli"
 version = "0.1.0"
 dependencies = [
  "rustnt-core",
+ "windows-sys",
 ]
 
 [[package]]
