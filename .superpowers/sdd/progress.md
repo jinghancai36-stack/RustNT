@@ -111,7 +111,10 @@ produce typed audit events. Rate-limited events omit the unvalidated requested P
   bounded UTF-16 decoding, and WTS memory guards.
 - CLI implementation: added strict `window list`, `window foreground`, and
   `session list` parsing, routing, stable renderers, and exit-code behavior.
-- Verification so far: 96 `rustnt-core` tests and 28 `rustnt-cli` tests passed;
-  core/CLI Clippy with `-D warnings` and rustfmt checks passed.
-- Final workspace verification and independent review remain before the Task13
-  implementation commit is created.
+- Verification: 97 `rustnt-core` tests, 28 `rustnt-cli` tests, and 1 Task09
+  target test passed; workspace build, workspace Clippy with `-D warnings`,
+  rustfmt, diff check, and all three real CLI smoke commands passed.
+- Independent review: approve; no Critical, Important, or Minor findings after
+  the WTS zero-count allocation fix.
+- Commits: `b289838`, `3446479`, `4851edf`.
+- Task13: complete; next capability is Task14 GUI foundation.
