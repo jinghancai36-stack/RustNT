@@ -1,6 +1,6 @@
 # Task13 Window and Session Viewer Report
 
-**Date:** 2026-09-22  
+**Date:** 2026-09-22
 **Scope:** Read-only current-user Windows window and Session inspection
 
 ## Implemented
@@ -30,7 +30,7 @@ The following checks passed during implementation:
 
 ```text
 cargo test -p rustnt-core -- --nocapture
-96 passed, 0 failed
+97 passed, 0 failed
 
 cargo test -p rustnt-cli -- --nocapture
 28 passed, 0 failed
@@ -49,7 +49,7 @@ The full workspace verification also passed:
 
 ```text
 cargo test --workspace -- --nocapture
-125 passed, 0 failed
+126 passed, 0 failed
 
 cargo build --workspace
 passed
