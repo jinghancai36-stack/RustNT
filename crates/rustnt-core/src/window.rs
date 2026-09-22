@@ -533,10 +533,10 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>, WindowError> {
         ));
     }
 
+    let memory = WtsMemory(sessions_ptr.cast());
     let sessions = if count == 0 {
         Vec::new()
     } else {
-        let memory = WtsMemory(sessions_ptr.cast());
         let session_rows = unsafe {
             // SAFETY: WTS returned count contiguous WTS_SESSION_INFOW values.
             slice::from_raw_parts(sessions_ptr, count as usize)
@@ -553,9 +553,9 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>, WindowError> {
                 is_active_console: session.SessionId == active_console_session,
             });
         }
-        drop(memory);
         sessions
     };
+    drop(memory);
 
     let mut sessions = sessions;
     sessions.sort_by_key(|session| session.session_id);
