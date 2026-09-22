@@ -10,6 +10,7 @@ use rustnt_core::filesystem::{
     AllowOrDeny, FileKind, FileMetadata, FilePermissions, SearchLimits, SearchReport,
 };
 use rustnt_core::monitor::{MonitorSampler, MonitorSnapshot};
+use rustnt_core::window::{SessionInfo, SessionState, WindowError, WindowInfo, WindowSnapshot};
 use rustnt_core::ProcessInfo;
 use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
 use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
@@ -46,6 +47,17 @@ enum FileSystemCommand {
     Space { path: String },
     Permissions { path: String },
     Search { path: String, name: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowCommand {
+    List,
+    Foreground,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionCommand {
+    List,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +114,42 @@ fn main() -> ExitCode {
         };
     }
 
+    if args.first().map(String::as_str) == Some("window") {
+        let command = match parse_window_command(&args[1..]) {
+            Ok(command) => command,
+            Err(error) => {
+                eprintln!("usage error: {error}");
+                print_usage();
+                return ExitCode::from(2);
+            }
+        };
+        return match run_window_command(command) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::from(1)
+            }
+        };
+    }
+
+    if args.first().map(String::as_str) == Some("session") {
+        let command = match parse_session_command(&args[1..]) {
+            Ok(command) => command,
+            Err(error) => {
+                eprintln!("usage error: {error}");
+                print_usage();
+                return ExitCode::from(2);
+            }
+        };
+        return match run_session_command(command) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::from(1)
+            }
+        };
+    }
+
     if args.first().map(String::as_str) != Some("process") {
         print_usage();
         return ExitCode::from(2);
@@ -136,7 +184,10 @@ fn print_usage() {
          usage: rustnt fs list --path <directory>\n\
          usage: rustnt fs space --path <path>\n\
          usage: rustnt fs permissions --path <path>\n\
-         usage: rustnt fs search --path <directory> --name <text>"
+         usage: rustnt fs search --path <directory> --name <text>\n\
+         usage: rustnt window list\n\
+         usage: rustnt window foreground\n\
+         usage: rustnt session list"
     );
 }
 
@@ -793,16 +844,165 @@ fn render_process_changes(
     }
 }
 
+fn parse_window_command(args: &[String]) -> Result<WindowCommand, String> {
+    if args.len() != 1 {
+        return Err("window requires exactly one command".to_string());
+    }
+    match args[0].as_str() {
+        "list" => Ok(WindowCommand::List),
+        "foreground" => Ok(WindowCommand::Foreground),
+        command => Err(format!("unknown window command: {command}")),
+    }
+}
+
+fn parse_session_command(args: &[String]) -> Result<SessionCommand, String> {
+    if args.len() != 1 {
+        return Err("session requires exactly one command".to_string());
+    }
+    match args[0].as_str() {
+        "list" => Ok(SessionCommand::List),
+        command => Err(format!("unknown session command: {command}")),
+    }
+}
+
+fn run_window_command(command: WindowCommand) -> Result<(), String> {
+    match command {
+        WindowCommand::List => {
+            let snapshot = rustnt_core::window::enumerate_windows().map_err(format_window_error)?;
+            println!("{}", render_window_snapshot(&snapshot));
+        }
+        WindowCommand::Foreground => {
+            let window = rustnt_core::window::foreground_window().map_err(format_window_error)?;
+            println!("{}", render_foreground_window(window.as_ref()));
+        }
+    }
+    Ok(())
+}
+
+fn run_session_command(command: SessionCommand) -> Result<(), String> {
+    match command {
+        SessionCommand::List => {
+            let sessions = rustnt_core::window::list_sessions().map_err(format_window_error)?;
+            println!("{}", render_sessions(&sessions));
+        }
+    }
+    Ok(())
+}
+
+fn format_window_error(error: WindowError) -> String {
+    error.to_string()
+}
+
+fn render_window_snapshot(snapshot: &WindowSnapshot) -> String {
+    let mut output = format!(
+        "RustNT Windows\n\nSESSION         {}\nDESKTOP         {}\nWINDOWS         {}\nSKIPPED         {}",
+        snapshot.current_session_id,
+        snapshot.current_desktop,
+        snapshot.windows.len(),
+        snapshot.skipped_windows
+    );
+    if !snapshot.windows.is_empty() {
+        output.push_str("\n\n");
+        output.push_str(
+            &snapshot
+                .windows
+                .iter()
+                .map(render_window_info)
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        );
+    }
+    output
+}
+
+fn render_window_info(window: &WindowInfo) -> String {
+    format!(
+        "HWND            {}\nTITLE           {}\nCLASS           {}\nPID             {}\nPROCESS         {}\nPATH            {}\nTHREAD          {}\nDESKTOP         {}\nSESSION         {}\nVISIBLE         {}\nMINIMIZED       {}\nFOREGROUND      {}",
+        rustnt_core::window::format_hwnd(window.hwnd),
+        window.title,
+        window.class_name,
+        window.pid,
+        rustnt_core::window::optional_text(window.process_name.clone()),
+        rustnt_core::window::optional_text(window.process_path.clone()),
+        window.thread_id,
+        rustnt_core::window::optional_text(window.desktop_name.clone()),
+        window.session_id,
+        yes_no(window.visible),
+        yes_no(window.minimized),
+        yes_no(window.foreground)
+    )
+}
+
+fn render_foreground_window(window: Option<&WindowInfo>) -> String {
+    match window {
+        Some(window) => format!("RustNT Foreground Window\n\n{}", render_window_info(window)),
+        None => "RustNT Foreground Window\n\nWINDOW          none".to_string(),
+    }
+}
+
+fn render_session_info(session: &SessionInfo) -> String {
+    format!(
+        "SESSION         {}\nSTATE           {}\nUSER            {}\nDOMAIN          {}\nCLIENT          {}\nCURRENT         {}\nCONSOLE         {}",
+        session.session_id,
+        session_state_name(&session.state),
+        rustnt_core::window::optional_text(session.username.clone()),
+        rustnt_core::window::optional_text(session.domain.clone()),
+        rustnt_core::window::optional_text(session.client_name.clone()),
+        yes_no(session.is_current_session),
+        yes_no(session.is_active_console)
+    )
+}
+
+fn render_sessions(sessions: &[SessionInfo]) -> String {
+    let mut output = String::from("RustNT Sessions");
+    if !sessions.is_empty() {
+        output.push_str("\n\n");
+        output.push_str(
+            &sessions
+                .iter()
+                .map(render_session_info)
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        );
+    }
+    output
+}
+
+fn session_state_name(state: &SessionState) -> String {
+    match state {
+        SessionState::Active => "ACTIVE".to_string(),
+        SessionState::Connected => "CONNECTED".to_string(),
+        SessionState::ConnectQuery => "CONNECT_QUERY".to_string(),
+        SessionState::Shadow => "SHADOW".to_string(),
+        SessionState::Disconnected => "DISCONNECTED".to_string(),
+        SessionState::Idle => "IDLE".to_string(),
+        SessionState::Listen => "LISTEN".to_string(),
+        SessionState::Reset => "RESET".to_string(),
+        SessionState::Down => "DOWN".to_string(),
+        SessionState::Init => "INIT".to_string(),
+        SessionState::Other(value) => format!("OTHER({value})"),
+    }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
         format_bytes, matches_filter, parse_filesystem_command, parse_monitor_options,
-        parse_options, parse_process_command, parse_service_command, render_disk_space,
-        render_file_metadata, render_identity, render_monitor, render_permissions,
-        render_process_inspection, render_process_status, render_processes, render_search,
-        service_state_is_ready, sort_processes, FileSystemCommand, ProcessCommand, ServiceCommand,
-        SortKey,
+        parse_options, parse_process_command, parse_service_command, parse_session_command,
+        parse_window_command, render_disk_space, render_file_metadata, render_foreground_window,
+        render_identity, render_monitor, render_permissions, render_process_inspection,
+        render_process_status, render_processes, render_search, render_session_info,
+        render_window_info, service_state_is_ready, sort_processes, FileSystemCommand,
+        ProcessCommand, ServiceCommand, SessionCommand, SortKey, WindowCommand,
     };
 
     #[test]
@@ -956,6 +1156,74 @@ mod tests {
                 "expected rejection for {args:?}"
             );
         }
+    }
+
+    #[test]
+    fn parses_window_and_session_commands() {
+        assert_eq!(
+            parse_window_command(&strings(&["list"])).expect("window list should parse"),
+            WindowCommand::List
+        );
+        assert_eq!(
+            parse_window_command(&strings(&["foreground"])).expect("foreground should parse"),
+            WindowCommand::Foreground
+        );
+        assert_eq!(
+            parse_session_command(&strings(&["list"])).expect("session list should parse"),
+            SessionCommand::List
+        );
+    }
+
+    #[test]
+    fn rejects_window_and_session_extra_arguments() {
+        for args in [vec![], vec!["list", "extra"], vec!["unknown"]] {
+            assert!(
+                parse_window_command(&strings(&args)).is_err(),
+                "expected rejection for {args:?}"
+            );
+        }
+        assert!(parse_session_command(&strings(&[])).is_err());
+        assert!(parse_session_command(&strings(&["list", "extra"])).is_err());
+    }
+
+    #[test]
+    fn renders_window_fields_in_fixed_order() {
+        let output = render_window_info(&sample_window_info());
+        for pair in [
+            ("HWND", "TITLE"),
+            ("TITLE", "CLASS"),
+            ("CLASS", "PID"),
+            ("PID", "PROCESS"),
+            ("PROCESS", "PATH"),
+            ("PATH", "THREAD"),
+            ("THREAD", "DESKTOP"),
+            ("DESKTOP", "SESSION"),
+            ("SESSION", "VISIBLE"),
+            ("VISIBLE", "MINIMIZED"),
+            ("MINIMIZED", "FOREGROUND"),
+        ] {
+            assert!(output.find(pair.0).unwrap() < output.find(pair.1).unwrap());
+        }
+        assert!(output.contains("VISIBLE         yes"));
+        assert!(output.contains("MINIMIZED       no"));
+    }
+
+    #[test]
+    fn renders_empty_foreground_and_session_optional_values() {
+        assert!(render_foreground_window(None).contains("WINDOW          none"));
+        let session = rustnt_core::window::SessionInfo {
+            session_id: 1,
+            state: rustnt_core::window::SessionState::Other(77),
+            username: None,
+            domain: None,
+            client_name: None,
+            is_current_session: false,
+            is_active_console: false,
+        };
+        let output = render_session_info(&session);
+        assert!(output.contains("STATE           OTHER(77)"));
+        assert!(output.contains("USER            N/A"));
+        assert!(output.contains("CURRENT         no"));
     }
 
     #[test]
@@ -1178,6 +1446,23 @@ mod tests {
             memory_bytes: None,
             path: path.map(str::to_string),
             cpu_percent: None,
+        }
+    }
+
+    fn sample_window_info() -> rustnt_core::window::WindowInfo {
+        rustnt_core::window::WindowInfo {
+            hwnd: 0x1234,
+            title: "TITLE".to_string(),
+            class_name: "CLASS".to_string(),
+            pid: 42,
+            process_name: Some("PROCESS".to_string()),
+            process_path: Some(r"C:\Apps\process.exe".to_string()),
+            thread_id: 7,
+            desktop_name: Some("Default".to_string()),
+            session_id: 1,
+            visible: true,
+            minimized: false,
+            foreground: false,
         }
     }
 

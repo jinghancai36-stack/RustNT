@@ -38,6 +38,27 @@ allow/deny ACEs; it does not expand groups or calculate effective access.
 These commands use the current user token, do not elevate, and do not call the
 LocalSystem service. Protected paths can still return access denied.
 
+## Window and session viewer
+
+Task13 adds three read-only user-mode commands:
+
+```text
+rustnt window list
+rustnt window foreground
+rustnt session list
+```
+
+`window list` enumerates top-level windows on the current desktop and in the
+current Windows Session, including hidden windows and windows with empty titles.
+`window foreground` reports the foreground window only when it belongs to that
+same Session and desktop. Both commands include best-effort process metadata
+when it is available. `session list` reports local Windows Session state,
+username, domain, client name, and current/active-console markers.
+
+Window and Session inspection is read-only. It does not start the LocalSystem
+service, request elevation, mutate window state, enumerate child windows, or
+cross the current Session/current desktop boundary.
+
 Longer-term experiments may cover filesystem performance, Windows Shell
 components, system monitoring, IPC, Native NT APIs, Windows services, and
 low-latency desktop components.

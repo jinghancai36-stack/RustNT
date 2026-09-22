@@ -103,3 +103,15 @@ produce typed audit events. Rate-limited events omit the unvalidated requested P
 - Task 4: complete (commit 5ada19e, review clean). Added `rustnt fs` CLI
   integration, documentation, and the Task12A verification report. CLI and
   workspace verification passed; independent review approved the implementation.
+
+## Task 13 Window and Session Viewer
+
+- Core implementation: added current-Session/current-desktop top-level window
+  enumeration, foreground lookup, WTS Session listing, process metadata joins,
+  bounded UTF-16 decoding, and WTS memory guards.
+- CLI implementation: added strict `window list`, `window foreground`, and
+  `session list` parsing, routing, stable renderers, and exit-code behavior.
+- Verification so far: 96 `rustnt-core` tests and 28 `rustnt-cli` tests passed;
+  core/CLI Clippy with `-D warnings` and rustfmt checks passed.
+- Final workspace verification and independent review remain before the Task13
+  implementation commit is created.

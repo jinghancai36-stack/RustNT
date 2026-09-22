@@ -5,6 +5,7 @@ pub mod filesystem;
 pub mod monitor;
 pub mod process_control;
 pub mod service;
+pub mod window;
 
 use std::collections::HashMap;
 use std::ffi::OsString;
