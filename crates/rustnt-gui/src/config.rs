@@ -1,6 +1,9 @@
 use std::fmt;
 use std::path::PathBuf;
 
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+
 pub const DEFAULT_WINDOW_WIDTH: f32 = 960.0;
 pub const DEFAULT_WINDOW_HEIGHT: f32 = 640.0;
 
@@ -239,11 +242,66 @@ pub fn save_config(paths: &ConfigPaths, config: &GuiConfig) -> Result<(), Config
         let _ = std::fs::remove_file(&temporary);
         return Err(ConfigError::new("write temporary configuration", error));
     }
-    if let Err(error) = std::fs::rename(&temporary, &paths.config_file) {
+    if let Err(error) = replace_config_file(&temporary, &paths.config_file) {
         let _ = std::fs::remove_file(&temporary);
         return Err(ConfigError::new("replace configuration", error));
     }
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_config_file(
+    temporary: &std::path::Path,
+    target: &std::path::Path,
+) -> std::io::Result<()> {
+    std::fs::rename(temporary, target)
+}
+
+#[cfg(windows)]
+fn replace_config_file(
+    temporary: &std::path::Path,
+    target: &std::path::Path,
+) -> std::io::Result<()> {
+    if !target.exists() {
+        return match std::fs::rename(temporary, target) {
+            Ok(()) => Ok(()),
+            Err(_error) if target.exists() => replace_existing_file(temporary, target),
+            Err(error) => Err(error),
+        };
+    }
+    replace_existing_file(temporary, target)
+}
+
+#[cfg(windows)]
+fn replace_existing_file(
+    temporary: &std::path::Path,
+    target: &std::path::Path,
+) -> std::io::Result<()> {
+    let target_wide = target
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let temporary_wide = temporary
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let replaced = unsafe {
+        windows_sys::Win32::Storage::FileSystem::ReplaceFileW(
+            target_wide.as_ptr(),
+            temporary_wide.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if replaced == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -308,6 +366,28 @@ mod tests {
         save_config(&paths, &expected).unwrap();
         let (actual, load) = load_config(&paths).unwrap();
         assert_eq!(actual, expected);
+        assert_eq!(load.notice, None);
+        assert!(!paths.config_file.with_extension("toml.tmp").exists());
+    }
+
+    #[test]
+    fn saving_twice_replaces_existing_config_and_cleans_temporary_file() {
+        let root = TestRoot::new("overwrite");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let first = GuiConfig::default();
+        let second = GuiConfig {
+            theme: ThemeMode::Light,
+            window_width: 1440.0,
+            window_height: 900.0,
+            window_x: Some(12.0),
+            window_y: Some(24.0),
+        };
+
+        save_config(&paths, &first).unwrap();
+        save_config(&paths, &second).unwrap();
+
+        let (actual, load) = load_config(&paths).unwrap();
+        assert_eq!(actual, second);
         assert_eq!(load.notice, None);
         assert!(!paths.config_file.with_extension("toml.tmp").exists());
     }
