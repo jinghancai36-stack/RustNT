@@ -76,3 +76,26 @@ included in the Task4 commit.
   interactively during this headless verification run.
 - The pre-existing Cargo warning about semver metadata remains until the
   dependency requirement is cleaned up in a separate change.
+
+## Cleanup Gap Fix
+
+Fixed the normal `eframe::run_native` cleanup path in `crates/rustnt-gui/src/main.rs`.
+The final shared configuration is copied first; a poisoned mutex records a
+`GuiError` and still allows `marker.remove()` to run. Cleanup errors are
+aggregated with configuration lock/save errors taking priority over marker
+removal errors. `run_native` errors and panics still leave the marker in place.
+
+Added a pure helper unit test proving configuration cleanup errors are returned
+before marker cleanup errors.
+
+## Cleanup Verification
+
+- `cargo test -p rustnt-gui -- --nocapture`: 19 passed.
+- `cargo check -p rustnt-gui`: passed.
+- `cargo clippy -p rustnt-gui --all-targets -- -D warnings`: passed.
+- `cargo fmt --all -- --check`: passed.
+- `git diff --check`: passed.
+- Historical `.superpowers/sdd/task-4-report.md`: no diff.
+
+The existing Cargo warning about ignored semver metadata on the `toml`
+dependency remains unchanged.

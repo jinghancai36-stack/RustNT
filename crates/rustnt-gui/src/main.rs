@@ -58,6 +58,21 @@ fn startup_config(loaded: GuiConfig, recovery: recovery::RecoveryState) -> GuiCo
     }
 }
 
+fn aggregate_cleanup_errors(errors: impl IntoIterator<Item = GuiError>) -> Result<(), GuiError> {
+    errors
+        .into_iter()
+        .min_by_key(cleanup_error_priority)
+        .map_or(Ok(()), Err)
+}
+
+fn cleanup_error_priority(error: &GuiError) -> u8 {
+    match error {
+        GuiError::Config(_) | GuiError::ConfigLock => 0,
+        GuiError::Recovery(_) => 1,
+        GuiError::Eframe(_) => 2,
+    }
+}
+
 fn run_gui() -> Result<(), GuiError> {
     let paths = config_paths_from_appdata()?;
     std::fs::create_dir_all(&paths.root).map_err(ConfigError::from)?;
@@ -87,12 +102,19 @@ fn run_gui() -> Result<(), GuiError> {
     );
     match result {
         Ok(()) => {
-            let final_config = shared.lock().map_err(|_| GuiError::ConfigLock)?.clone();
-            let save_result = save_config(&paths, &final_config);
-            let remove_result = marker.remove();
-            remove_result?;
-            save_result?;
-            Ok(())
+            let mut cleanup_errors = Vec::new();
+            match shared.lock() {
+                Ok(final_config) => {
+                    if let Err(error) = save_config(&paths, &final_config) {
+                        cleanup_errors.push(error.into());
+                    }
+                }
+                Err(_) => cleanup_errors.push(GuiError::ConfigLock),
+            }
+            if let Err(error) = marker.remove() {
+                cleanup_errors.push(error.into());
+            }
+            aggregate_cleanup_errors(cleanup_errors)
         }
         Err(error) => Err(GuiError::Eframe(error)),
     }
@@ -107,9 +129,22 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::startup_config;
+    use super::{aggregate_cleanup_errors, startup_config, GuiError};
     use crate::config::{GuiConfig, ThemeMode};
-    use crate::recovery::RecoveryState;
+    use crate::recovery::{RecoveryError, RecoveryState};
+
+    #[test]
+    fn cleanup_returns_configuration_error_before_marker_error() {
+        let marker_error = GuiError::Recovery(RecoveryError {
+            operation: "remove runtime marker".to_owned(),
+            message: "access denied".to_owned(),
+        });
+
+        let error = aggregate_cleanup_errors(vec![marker_error, GuiError::ConfigLock])
+            .expect_err("cleanup should report its highest-priority error");
+
+        assert!(matches!(error, GuiError::ConfigLock));
+    }
 
     #[test]
     fn recovery_uses_safe_defaults_and_normal_start_uses_loaded_settings() {
