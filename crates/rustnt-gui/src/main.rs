@@ -73,6 +73,40 @@ fn cleanup_error_priority(error: &GuiError) -> u8 {
     }
 }
 
+fn cleanup_after_normal_exit(
+    shared: &SharedConfig,
+    save: impl FnOnce(&GuiConfig) -> Result<(), ConfigError>,
+    remove: impl FnOnce() -> Result<(), RecoveryError>,
+) -> Result<(), GuiError> {
+    let final_config = match shared.lock() {
+        Ok(config) => Ok(config.clone()),
+        Err(_) => Err(GuiError::ConfigLock),
+    };
+    let mut cleanup_errors = Vec::new();
+    match final_config {
+        Ok(config) => {
+            if let Err(error) = save(&config) {
+                cleanup_errors.push(error.into());
+            }
+        }
+        Err(error) => cleanup_errors.push(error),
+    }
+    if let Err(error) = remove() {
+        cleanup_errors.push(error.into());
+    }
+    aggregate_cleanup_errors(cleanup_errors)
+}
+
+fn finish_run_native(
+    result: Result<(), eframe::Error>,
+    cleanup: impl FnOnce() -> Result<(), GuiError>,
+) -> Result<(), GuiError> {
+    match result {
+        Ok(()) => cleanup(),
+        Err(error) => Err(GuiError::Eframe(error)),
+    }
+}
+
 fn run_gui() -> Result<(), GuiError> {
     let paths = config_paths_from_appdata()?;
     std::fs::create_dir_all(&paths.root).map_err(ConfigError::from)?;
@@ -100,24 +134,13 @@ fn run_gui() -> Result<(), GuiError> {
             )))
         }),
     );
-    match result {
-        Ok(()) => {
-            let mut cleanup_errors = Vec::new();
-            match shared.lock() {
-                Ok(final_config) => {
-                    if let Err(error) = save_config(&paths, &final_config) {
-                        cleanup_errors.push(error.into());
-                    }
-                }
-                Err(_) => cleanup_errors.push(GuiError::ConfigLock),
-            }
-            if let Err(error) = marker.remove() {
-                cleanup_errors.push(error.into());
-            }
-            aggregate_cleanup_errors(cleanup_errors)
-        }
-        Err(error) => Err(GuiError::Eframe(error)),
-    }
+    finish_run_native(result, || {
+        cleanup_after_normal_exit(
+            &shared,
+            |final_config| save_config(&paths, final_config),
+            || marker.remove(),
+        )
+    })
 }
 
 fn main() {
@@ -129,9 +152,116 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{aggregate_cleanup_errors, startup_config, GuiError};
-    use crate::config::{GuiConfig, ThemeMode};
+    use super::{
+        aggregate_cleanup_errors, cleanup_after_normal_exit, finish_run_native, startup_config,
+        GuiError,
+    };
+    use crate::config::{ConfigError, GuiConfig, ThemeMode};
     use crate::recovery::{RecoveryError, RecoveryState};
+    use std::sync::{Arc, Mutex};
+
+    fn recovery_error() -> RecoveryError {
+        RecoveryError {
+            operation: "remove runtime marker".to_owned(),
+            message: "access denied".to_owned(),
+        }
+    }
+
+    fn config_error() -> ConfigError {
+        ConfigError {
+            operation: "save configuration".to_owned(),
+            message: "disk full".to_owned(),
+        }
+    }
+
+    #[test]
+    fn normal_cleanup_clones_before_save_and_removes_after_save_success() {
+        let shared = Arc::new(Mutex::new(GuiConfig::default()));
+        let shared_for_save = Arc::clone(&shared);
+        let mut remove_called = false;
+
+        let result = cleanup_after_normal_exit(
+            &shared,
+            |config| {
+                assert_eq!(config, &GuiConfig::default());
+                assert!(shared_for_save.try_lock().is_ok());
+                Ok(())
+            },
+            || {
+                remove_called = true;
+                Ok(())
+            },
+        );
+
+        assert!(result.is_ok());
+        assert!(remove_called);
+    }
+
+    #[test]
+    fn normal_cleanup_removes_after_save_failure_and_prioritizes_config_error() {
+        let shared = Arc::new(Mutex::new(GuiConfig::default()));
+        let mut remove_called = false;
+
+        let result = cleanup_after_normal_exit(
+            &shared,
+            |_| Err(config_error()),
+            || {
+                remove_called = true;
+                Err(recovery_error())
+            },
+        )
+        .expect_err("save failure should be returned");
+
+        assert!(remove_called);
+        assert!(matches!(result, GuiError::Config(_)));
+    }
+
+    #[test]
+    fn normal_cleanup_prioritizes_lock_error_and_still_removes_marker() {
+        let shared = Arc::new(Mutex::new(GuiConfig::default()));
+        let shared_for_poison = Arc::clone(&shared);
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = shared_for_poison.lock().unwrap();
+            panic!("poison configuration lock");
+        });
+        let mut save_called = false;
+        let mut remove_called = false;
+
+        let result = cleanup_after_normal_exit(
+            &shared,
+            |_| {
+                save_called = true;
+                Ok(())
+            },
+            || {
+                remove_called = true;
+                Err(recovery_error())
+            },
+        )
+        .expect_err("lock failure should be returned");
+
+        assert!(!save_called);
+        assert!(remove_called);
+        assert!(matches!(result, GuiError::ConfigLock));
+    }
+
+    #[test]
+    fn run_native_error_skips_normal_cleanup_and_preserves_marker() {
+        let mut cleanup_called = false;
+        let result = finish_run_native(
+            Err(eframe::Error::AppCreation(Box::new(std::io::Error::other(
+                "window creation failed",
+            )))),
+            || {
+                cleanup_called = true;
+                Ok(())
+            },
+        )
+        .expect_err("run_native errors should be returned");
+
+        assert!(!cleanup_called);
+        assert!(matches!(result, GuiError::Eframe(_)));
+    }
 
     #[test]
     fn cleanup_returns_configuration_error_before_marker_error() {
