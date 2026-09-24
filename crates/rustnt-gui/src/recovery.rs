@@ -94,9 +94,10 @@ pub fn append_crash_record(path: &Path, summary: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-pub fn install_panic_hook(crash_log: PathBuf) {
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |panic_info| {
+type PanicHook = Box<dyn for<'a> Fn(&std::panic::PanicHookInfo<'a>) + Send + Sync + 'static>;
+
+fn make_panic_hook(crash_log: PathBuf, previous: PanicHook) -> PanicHook {
+    Box::new(move |panic_info| {
         let summary = panic_info
             .payload()
             .downcast_ref::<&str>()
@@ -110,7 +111,12 @@ pub fn install_panic_hook(crash_log: PathBuf) {
             .unwrap_or("panic");
         let _ = append_crash_record(&crash_log, summary);
         previous(panic_info);
-    }));
+    })
+}
+
+pub fn install_panic_hook(crash_log: PathBuf) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(make_panic_hook(crash_log, previous));
 }
 
 #[cfg(test)]
@@ -118,7 +124,29 @@ mod tests {
     use super::*;
     use crate::config::config_paths_from_root;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static PANIC_HOOK_LOCK: Mutex<()> = Mutex::new(());
+
+    struct PanicHookGuard(Option<PanicHook>);
+
+    impl PanicHookGuard {
+        fn install(hook: PanicHook) -> Self {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(hook);
+            Self(Some(previous))
+        }
+    }
+
+    impl Drop for PanicHookGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                std::panic::set_hook(previous);
+            }
+        }
+    }
 
     struct TestRoot(PathBuf);
 
@@ -163,6 +191,10 @@ mod tests {
         assert!(inspect(&paths).unwrap().previous_run_incomplete);
         let marker = create_marker(&paths).unwrap();
         assert!(paths.marker_file.exists());
+        drop(marker);
+        assert!(paths.marker_file.exists());
+
+        let marker = create_marker(&paths).unwrap();
         marker.remove().unwrap();
         assert!(!paths.marker_file.exists());
     }
@@ -173,5 +205,57 @@ mod tests {
         std::fs::create_dir_all(root.path()).unwrap();
         let result = append_crash_record(root.path(), "panic summary");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn panic_hook_ignores_log_failure_and_calls_previous_hook() {
+        let _lock = PANIC_HOOK_LOCK.lock().unwrap();
+        let root = TestRoot::new("hook-log-failure");
+        std::fs::create_dir_all(root.path()).unwrap();
+        let paths = config_paths_from_root(root.path().to_owned());
+        let marker = create_marker(&paths).unwrap();
+        let previous_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&previous_calls);
+        let hook = make_panic_hook(
+            root.path().to_owned(),
+            Box::new(move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let _guard = PanicHookGuard::install(hook);
+
+        let result = std::panic::catch_unwind(|| panic!("panic while log path is a directory"));
+
+        assert!(result.is_err());
+        assert_eq!(previous_calls.load(Ordering::SeqCst), 1);
+        assert!(paths.marker_file.exists());
+        drop(marker);
+    }
+
+    #[test]
+    fn panic_hook_writes_one_line_and_keeps_marker_after_panic() {
+        let _lock = PANIC_HOOK_LOCK.lock().unwrap();
+        let root = TestRoot::new("hook-line");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let marker = create_marker(&paths).unwrap();
+        let previous_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&previous_calls);
+        let hook = make_panic_hook(
+            paths.crash_log.clone(),
+            Box::new(move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let _guard = PanicHookGuard::install(hook);
+
+        let result = std::panic::catch_unwind(|| panic!("first\r\nsecond\rthird\n"));
+
+        assert!(result.is_err());
+        assert_eq!(previous_calls.load(Ordering::SeqCst), 1);
+        let log = std::fs::read_to_string(&paths.crash_log).unwrap();
+        assert_eq!(log.lines().count(), 1);
+        assert!(log.contains("first  second third "));
+        assert!(paths.marker_file.exists());
+        drop(marker);
     }
 }
