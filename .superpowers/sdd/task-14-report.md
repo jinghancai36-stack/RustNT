@@ -214,3 +214,39 @@ The commands continue to show the pre-existing Cargo warning that the
 `toml` dependency version contains ignored semver metadata. The protected
 Task14 spec/plan, README, roadmap, progress ledger, and historical Task04
 report were unchanged.
+
+## Final Windows Liveness Fix: 2026-09-24
+
+The non-current-PID marker path now opens processes with
+`PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE` and uses
+`WaitForSingleObject(handle, 0)` for liveness. `WAIT_TIMEOUT` maps to running,
+`WAIT_OBJECT_0` maps to stale, and every other wait result maps to unknown.
+`GetProcessTimes` is called only after the wait confirms that the process is
+running, and its creation timestamp must match the marker timestamp before a
+marker is preserved. Every opened process handle is closed with `CloseHandle`.
+The `GetExitCodeProcess`/`STILL_ACTIVE` path was removed, so an actual exit
+code of 259 cannot be mistaken for a live process.
+
+Current-PID markers continue to compare against the current process creation
+time. Markers without a creation timestamp retain legacy behavior, and the
+non-Windows fallback remains unknown-liveness compatible.
+
+Windows tests cover wait-result mapping, the zero-time wait helper on the
+current process, and current-PID creation-time mismatch cleanup. The tests do
+not create a process with exit code 259.
+
+Final verification for this repair:
+
+```text
+cargo test -p rustnt-gui -- --nocapture: 35 passed, 0 failed
+cargo check --workspace --all-targets: pass
+cargo build --workspace --all-targets: pass
+cargo clippy --workspace --all-targets -- -D warnings: pass
+cargo fmt --all -- --check: pass
+git diff --check: pass
+```
+
+The commands continue to show the pre-existing Cargo warning that the
+`toml` dependency version contains ignored semver metadata. Only
+`crates/rustnt-gui/src/recovery.rs` and this report were changed in this
+repair.

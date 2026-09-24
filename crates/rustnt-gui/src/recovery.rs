@@ -226,11 +226,12 @@ mod windows_process {
     use super::{MarkerIdentity, MarkerLiveness};
     use std::io;
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, STILL_ACTIVE,
+        CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
     };
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess,
-        PROCESS_QUERY_LIMITED_INFORMATION,
+        GetCurrentProcess, GetProcessTimes, OpenProcess, WaitForSingleObject,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     };
 
     pub fn current_process_creation_time_100ns() -> io::Result<u64> {
@@ -251,7 +252,11 @@ mod windows_process {
         }
 
         unsafe {
-            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, marker.pid);
+            let process = OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                marker.pid,
+            );
             if process.is_null() {
                 return if GetLastError() == ERROR_INVALID_PARAMETER {
                     MarkerLiveness::Stale
@@ -270,12 +275,10 @@ mod windows_process {
         process: HANDLE,
         expected_creation_time_100ns: Option<u64>,
     ) -> MarkerLiveness {
-        let mut exit_code = 0;
-        if GetExitCodeProcess(process, &mut exit_code) == 0 {
-            return MarkerLiveness::Unknown;
-        }
-        if exit_code != STILL_ACTIVE as u32 {
-            return MarkerLiveness::Stale;
+        match zero_time_wait(process) {
+            ProcessWait::Running => {}
+            ProcessWait::Exited => return MarkerLiveness::Stale,
+            ProcessWait::Unknown => return MarkerLiveness::Unknown,
         }
         let Some(expected_creation_time_100ns) = expected_creation_time_100ns else {
             return MarkerLiveness::Running;
@@ -285,6 +288,25 @@ mod windows_process {
             Ok(_) => MarkerLiveness::Stale,
             Err(_) => MarkerLiveness::Unknown,
         }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ProcessWait {
+        Running,
+        Exited,
+        Unknown,
+    }
+
+    fn map_wait_result(wait_result: u32) -> ProcessWait {
+        match wait_result {
+            WAIT_TIMEOUT => ProcessWait::Running,
+            WAIT_OBJECT_0 => ProcessWait::Exited,
+            _ => ProcessWait::Unknown,
+        }
+    }
+
+    unsafe fn zero_time_wait(process: HANDLE) -> ProcessWait {
+        map_wait_result(WaitForSingleObject(process, 0))
     }
 
     unsafe fn process_creation_time_100ns(process: HANDLE) -> io::Result<u64> {
@@ -318,6 +340,26 @@ mod windows_process {
             (u64::from(creation_time.dwHighDateTime) << 32)
                 | u64::from(creation_time.dwLowDateTime),
         )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+
+        #[test]
+        fn zero_time_wait_maps_running_exited_and_unknown_results() {
+            assert_eq!(map_wait_result(WAIT_TIMEOUT), ProcessWait::Running);
+            assert_eq!(map_wait_result(WAIT_OBJECT_0), ProcessWait::Exited);
+            assert_eq!(map_wait_result(WAIT_FAILED), ProcessWait::Unknown);
+        }
+
+        #[test]
+        fn zero_time_wait_reports_current_process_as_running() {
+            let result = unsafe { zero_time_wait(GetCurrentProcess()) };
+
+            assert_eq!(result, ProcessWait::Running);
+        }
     }
 }
 
