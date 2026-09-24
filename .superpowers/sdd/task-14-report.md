@@ -181,3 +181,36 @@ cargo clippy --workspace --all-targets -- -D warnings: pass
 cargo fmt --all -- --check: pass
 git diff --check: pass
 ```
+
+## Final PID Reuse Fix: 2026-09-24
+
+The runtime marker now records `pid`, `started_at`, and the Windows process
+creation timestamp as `creation_time_100ns`. Marker inspection compares that
+timestamp with the process identified by the marker PID. A live PID with a
+different creation timestamp is stale and is removed, while a live PID with
+the same timestamp remains running. The Windows FFI is contained in narrow
+safe wrappers: the current process uses `GetCurrentProcess` plus
+`GetProcessTimes`, and other PIDs use `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`
+plus `GetProcessTimes` after an exit-code liveness check.
+
+Markers without `creation_time_100ns` retain legacy behavior: a live PID is
+preserved and a dead or invalid PID is cleaned up. Non-Windows builds retain
+the existing compile-compatible unknown-liveness behavior. Windows tests now
+cover matching current-process preservation, current-PID creation-time
+mismatch cleanup, invalid-PID cleanup, and legacy marker recognition.
+
+Final verification for this repair:
+
+```text
+cargo test -p rustnt-gui -- --nocapture: 33 passed, 0 failed
+cargo check --workspace --all-targets: pass
+cargo build --workspace --all-targets: pass
+cargo clippy --workspace --all-targets -- -D warnings: pass
+cargo fmt --all -- --check: pass
+git diff --check: pass
+```
+
+The commands continue to show the pre-existing Cargo warning that the
+`toml` dependency version contains ignored semver metadata. The protected
+Task14 spec/plan, README, roadmap, progress ledger, and historical Task04
+report were unchanged.

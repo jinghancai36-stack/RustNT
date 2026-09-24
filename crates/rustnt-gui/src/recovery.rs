@@ -5,15 +5,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(windows)]
-use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, STILL_ACTIVE,
-};
-#[cfg(windows)]
-use windows_sys::Win32::System::Threading::{
-    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-};
-
 const MARKER_SIDECAR_SUFFIX: &str = ".marker";
 const MAX_CRASH_RECORD_BYTES: usize = 4096;
 static MARKER_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -65,7 +56,7 @@ pub fn inspect(paths: &ConfigPaths) -> Result<RecoveryState, RecoveryError> {
             Err(error) => return Err(RecoveryError::new("inspect runtime marker", error)),
         };
         previous_run_incomplete = true;
-        match marker_liveness(marker_pid(&contents)) {
+        match marker_liveness(marker_identity(&contents)) {
             MarkerLiveness::Stale => remove_stale_marker(&path)?,
             MarkerLiveness::Running | MarkerLiveness::Unknown => {}
         }
@@ -78,8 +69,13 @@ pub fn inspect(paths: &ConfigPaths) -> Result<RecoveryState, RecoveryError> {
 pub fn create_marker(paths: &ConfigPaths) -> Result<RuntimeMarker, RecoveryError> {
     std::fs::create_dir_all(&paths.root)
         .map_err(|error| RecoveryError::new("create runtime marker directory", error))?;
+    let creation_time = current_process_creation_time_100ns()
+        .map_err(|error| RecoveryError::new("query current process creation time", error))?;
+    let creation_time_line = creation_time
+        .map(|value| format!("creation_time_100ns={value}\n"))
+        .unwrap_or_default();
     let contents = format!(
-        "pid={}\nstarted_at={}\n",
+        "pid={}\nstarted_at={}\n{creation_time_line}",
         std::process::id(),
         unix_timestamp_nanos()
     );
@@ -174,10 +170,24 @@ fn marker_paths(paths: &ConfigPaths) -> Result<Vec<PathBuf>, RecoveryError> {
     Ok(paths_to_inspect)
 }
 
-fn marker_pid(contents: &str) -> Option<u32> {
-    contents.lines().find_map(|line| {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MarkerIdentity {
+    pid: u32,
+    creation_time_100ns: Option<u64>,
+}
+
+fn marker_identity(contents: &str) -> Option<MarkerIdentity> {
+    let pid = contents.lines().find_map(|line| {
         line.strip_prefix("pid=")
             .and_then(|value| value.trim().parse::<u32>().ok())
+    })?;
+    let creation_time_100ns = contents.lines().find_map(|line| {
+        line.strip_prefix("creation_time_100ns=")
+            .and_then(|value| value.trim().parse::<u64>().ok())
+    });
+    Some(MarkerIdentity {
+        pid,
+        creation_time_100ns,
     })
 }
 
@@ -189,40 +199,126 @@ enum MarkerLiveness {
 }
 
 #[cfg(windows)]
-fn marker_liveness(pid: Option<u32>) -> MarkerLiveness {
-    let Some(pid) = pid else {
+fn marker_liveness(marker: Option<MarkerIdentity>) -> MarkerLiveness {
+    let Some(marker) = marker else {
         return MarkerLiveness::Unknown;
     };
-    if pid == std::process::id() {
-        return MarkerLiveness::Running;
-    }
-
-    unsafe {
-        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if process.is_null() {
-            return if GetLastError() == ERROR_INVALID_PARAMETER {
-                MarkerLiveness::Stale
-            } else {
-                MarkerLiveness::Unknown
-            };
-        }
-
-        let mut exit_code = 0;
-        let liveness = if GetExitCodeProcess(process, &mut exit_code) == 0 {
-            MarkerLiveness::Unknown
-        } else if exit_code == STILL_ACTIVE as u32 {
-            MarkerLiveness::Running
-        } else {
-            MarkerLiveness::Stale
-        };
-        let _ = CloseHandle(process);
-        liveness
-    }
+    windows_process::marker_liveness(marker)
 }
 
 #[cfg(not(windows))]
-fn marker_liveness(_pid: Option<u32>) -> MarkerLiveness {
+fn marker_liveness(_marker: Option<MarkerIdentity>) -> MarkerLiveness {
     MarkerLiveness::Unknown
+}
+
+#[cfg(windows)]
+fn current_process_creation_time_100ns() -> std::io::Result<Option<u64>> {
+    windows_process::current_process_creation_time_100ns().map(Some)
+}
+
+#[cfg(not(windows))]
+fn current_process_creation_time_100ns() -> std::io::Result<Option<u64>> {
+    Ok(None)
+}
+
+#[cfg(windows)]
+mod windows_process {
+    use super::{MarkerIdentity, MarkerLiveness};
+    use std::io;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, STILL_ACTIVE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    pub fn current_process_creation_time_100ns() -> io::Result<u64> {
+        // GetCurrentProcess returns a pseudo-handle that must not be closed.
+        unsafe { process_creation_time_100ns(GetCurrentProcess()) }
+    }
+
+    pub fn marker_liveness(marker: MarkerIdentity) -> MarkerLiveness {
+        if marker.pid == std::process::id() {
+            return match marker.creation_time_100ns {
+                None => MarkerLiveness::Running,
+                Some(expected) => match current_process_creation_time_100ns() {
+                    Ok(actual) if actual == expected => MarkerLiveness::Running,
+                    Ok(_) => MarkerLiveness::Stale,
+                    Err(_) => MarkerLiveness::Unknown,
+                },
+            };
+        }
+
+        unsafe {
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, marker.pid);
+            if process.is_null() {
+                return if GetLastError() == ERROR_INVALID_PARAMETER {
+                    MarkerLiveness::Stale
+                } else {
+                    MarkerLiveness::Unknown
+                };
+            }
+
+            let liveness = process_liveness(process, marker.creation_time_100ns);
+            let _ = CloseHandle(process);
+            liveness
+        }
+    }
+
+    unsafe fn process_liveness(
+        process: HANDLE,
+        expected_creation_time_100ns: Option<u64>,
+    ) -> MarkerLiveness {
+        let mut exit_code = 0;
+        if GetExitCodeProcess(process, &mut exit_code) == 0 {
+            return MarkerLiveness::Unknown;
+        }
+        if exit_code != STILL_ACTIVE as u32 {
+            return MarkerLiveness::Stale;
+        }
+        let Some(expected_creation_time_100ns) = expected_creation_time_100ns else {
+            return MarkerLiveness::Running;
+        };
+        match process_creation_time_100ns(process) {
+            Ok(actual) if actual == expected_creation_time_100ns => MarkerLiveness::Running,
+            Ok(_) => MarkerLiveness::Stale,
+            Err(_) => MarkerLiveness::Unknown,
+        }
+    }
+
+    unsafe fn process_creation_time_100ns(process: HANDLE) -> io::Result<u64> {
+        let mut creation_time = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut exit_time = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut kernel_time = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut user_time = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        if GetProcessTimes(
+            process,
+            &mut creation_time,
+            &mut exit_time,
+            &mut kernel_time,
+            &mut user_time,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(
+            (u64::from(creation_time.dwHighDateTime) << 32)
+                | u64::from(creation_time.dwLowDateTime),
+        )
+    }
 }
 
 fn remove_stale_marker(path: &Path) -> Result<(), RecoveryError> {
@@ -377,12 +473,18 @@ mod tests {
         assert!(!inspect(&paths).unwrap().previous_run_incomplete);
     }
 
+    #[cfg(windows)]
     #[test]
     fn current_process_marker_is_preserved_during_inspection() {
         let root = TestRoot::new("current-process-marker");
         let paths = config_paths_from_root(root.path().to_owned());
         let marker = create_marker(&paths).unwrap();
         let marker_path = marker.path.clone();
+        let contents = std::fs::read_to_string(&marker_path).unwrap();
+
+        assert!(contents
+            .lines()
+            .any(|line| line.starts_with("creation_time_100ns=")));
 
         assert!(inspect(&paths).unwrap().previous_run_incomplete);
         assert!(marker_path.exists());
@@ -390,6 +492,27 @@ mod tests {
         marker.remove().unwrap();
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn current_pid_with_mismatched_creation_time_is_stale() {
+        let root = TestRoot::new("mismatched-current-process-marker");
+        let paths = config_paths_from_root(root.path().to_owned());
+        std::fs::create_dir_all(root.path()).unwrap();
+        std::fs::write(
+            &paths.marker_file,
+            format!(
+                "pid={}\nstarted_at=old\ncreation_time_100ns={}\n",
+                std::process::id(),
+                u64::MAX
+            ),
+        )
+        .unwrap();
+
+        assert!(inspect(&paths).unwrap().previous_run_incomplete);
+        assert!(!paths.marker_file.exists());
+    }
+
+    #[cfg(windows)]
     #[test]
     fn exited_sidecar_marker_reports_recovery_and_is_cleaned() {
         let root = TestRoot::new("stale-sidecar");
@@ -430,13 +553,14 @@ mod tests {
         assert!(!inspect(&paths).unwrap().previous_run_incomplete);
     }
 
+    #[cfg(windows)]
     #[test]
     fn legacy_marker_is_detected_without_being_overwritten_or_removed() {
         let root = TestRoot::new("legacy-marker");
         let paths = config_paths_from_root(root.path().to_owned());
         std::fs::create_dir_all(root.path()).unwrap();
-        let legacy_contents = "pid=old\nstarted_at=old\n";
-        std::fs::write(&paths.marker_file, legacy_contents).unwrap();
+        let legacy_contents = format!("pid={}\nstarted_at=old\n", std::process::id());
+        std::fs::write(&paths.marker_file, &legacy_contents).unwrap();
 
         assert!(inspect(&paths).unwrap().previous_run_incomplete);
         let marker = create_marker(&paths).unwrap();
@@ -449,6 +573,7 @@ mod tests {
         assert!(paths.marker_file.exists());
     }
 
+    #[cfg(windows)]
     #[test]
     fn exited_legacy_marker_is_cleaned_but_legacy_format_remains_supported() {
         let root = TestRoot::new("stale-legacy-marker");
