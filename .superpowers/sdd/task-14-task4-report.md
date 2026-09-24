@@ -99,3 +99,31 @@ before marker cleanup errors.
 
 The existing Cargo warning about ignored semver metadata on the `toml`
 dependency remains unchanged.
+
+## Task14 Follow-up Fix
+
+Updated only `crates/rustnt-gui/src/main.rs` for the normal-exit cleanup and
+`run_native` error branch.
+
+- Normal exit now clones `GuiConfig` while holding the shared mutex and drops
+  the guard before calling `save_config`, so configuration file I/O cannot run
+  while the mutex is held.
+- Added a small injectable cleanup helper. Its tests verify that marker
+  removal runs after a successful save, still runs after a save failure, and
+  remains attempted after a poisoned lock. Configuration and lock errors take
+  priority over marker removal errors.
+- Added a minimal `run_native` result helper test proving the error branch
+  skips normal cleanup, preserving the marker. The existing recovery panic
+  marker tests remain the coverage for panic behavior.
+
+## Follow-up Verification
+
+- `cargo test -p rustnt-gui -- --nocapture`: 23 passed.
+- `cargo check -p rustnt-gui`: passed.
+- `cargo clippy -p rustnt-gui --all-targets -- -D warnings`: passed.
+- `cargo fmt --all -- --check`: passed.
+- `git diff --check`: passed.
+
+The existing Cargo warning about ignored semver metadata on the `toml`
+dependency remains unchanged. The expected panic message from the poisoned
+mutex test is caught by the test and does not indicate a test failure.
