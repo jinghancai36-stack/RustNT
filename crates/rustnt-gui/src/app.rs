@@ -2,13 +2,15 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use eframe::egui;
 
-use crate::config::{save_config, ConfigLoad, ConfigPaths, GuiConfig, ThemeMode};
+use crate::config::{save_config, ConfigPaths, GuiConfig, ThemeMode};
 use crate::recovery::RecoveryState;
 
 const RECOVERY_NOTICE: &str = "Previous run did not exit normally. Safe defaults are active.";
 
+pub type SharedConfig = Arc<Mutex<GuiConfig>>;
+
 pub struct RustNtApp {
-    pub(crate) config: Arc<Mutex<GuiConfig>>,
+    pub(crate) config: SharedConfig,
     pub(crate) paths: ConfigPaths,
     pub(crate) recovery: RecoveryState,
     pub(crate) config_notice: Option<String>,
@@ -17,21 +19,16 @@ pub struct RustNtApp {
 
 impl RustNtApp {
     pub fn new(
-        config: GuiConfig,
+        config: SharedConfig,
         paths: ConfigPaths,
-        load: ConfigLoad,
         recovery: RecoveryState,
+        config_notice: Option<String>,
     ) -> Self {
-        let config = if recovery.previous_run_incomplete {
-            GuiConfig::default()
-        } else {
-            config
-        };
         Self {
-            config: Arc::new(Mutex::new(config)),
+            config,
             paths,
             recovery,
-            config_notice: load.notice,
+            config_notice,
             save_notice: None,
         }
     }

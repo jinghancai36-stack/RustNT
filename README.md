@@ -126,5 +126,21 @@ lines, scripts, arbitrary exit codes, or shell commands. The CLI does not
 perform elevation and does not open target processes with termination rights;
 the LocalSystem service remains the privileged boundary.
 
+## GUI foundation
+
+Launch the Windows GUI with:
+
+```text
+cargo run -p rustnt-gui
+```
+
+The GUI is a normal Windows user-mode process hosted by `eframe`, `winit`, and
+`egui`. It stores settings, the incomplete-run marker, and the crash log under
+`%APPDATA%\\RustNT`. If `gui.running` remains after an incomplete run, the next
+launch enters safe recovery mode with default settings and window geometry.
+
+Task14 does not replace Explorer, the taskbar, the Windows kernel, or the
+existing service authorization boundary.
+
 RustNT is a normal Windows user-mode project. It is not an operating system and
 does not replace the Windows kernel, drivers, or compatibility infrastructure.
