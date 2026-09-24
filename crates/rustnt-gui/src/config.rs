@@ -409,7 +409,7 @@ mod tests {
         let (actual, load) = load_config(&paths).unwrap();
         assert_eq!(actual, expected);
         assert_eq!(load.notice, None);
-        assert!(!paths.config_file.with_extension("toml.tmp").exists());
+        assert_no_temporary_configs(&paths);
     }
 
     #[test]
@@ -431,7 +431,7 @@ mod tests {
         let (actual, load) = load_config(&paths).unwrap();
         assert_eq!(actual, second);
         assert_eq!(load.notice, None);
-        assert!(!paths.config_file.with_extension("toml.tmp").exists());
+        assert_no_temporary_configs(&paths);
     }
 
     #[test]
@@ -456,9 +456,58 @@ mod tests {
         assert!(temporary_paths
             .iter()
             .all(|path| path.parent() == paths.config_file.parent()));
-        assert!(temporary_paths
-            .iter()
-            .all(|path| path != &paths.config_file.with_extension("toml.tmp")));
+        assert!(temporary_paths.iter().all(|path| is_temporary_config(path)));
+    }
+
+    #[test]
+    fn concurrent_save_config_calls_leave_valid_toml_without_temporary_files() {
+        let root = TestRoot::new("concurrent-save");
+        let paths = Arc::new(config_paths_from_root(root.path().to_owned()));
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let handles = (0..16)
+            .map(|index| {
+                let paths = Arc::clone(&paths);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    save_config(
+                        &paths,
+                        &GuiConfig {
+                            theme: if index % 2 == 0 {
+                                ThemeMode::Dark
+                            } else {
+                                ThemeMode::Light
+                            },
+                            window_width: 800.0 + index as f32,
+                            window_height: 600.0 + index as f32,
+                            window_x: Some(index as f32),
+                            window_y: Some((index * 2) as f32),
+                        },
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        let encoded = std::fs::read_to_string(&paths.config_file).unwrap();
+        toml::from_str::<toml::Value>(&encoded).unwrap();
+        assert_no_temporary_configs(&paths);
+    }
+
+    fn is_temporary_config(path: &Path) -> bool {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("gui.toml.") && name.ends_with(".tmp"))
+    }
+
+    fn assert_no_temporary_configs(paths: &ConfigPaths) {
+        let entries = std::fs::read_dir(&paths.root).unwrap();
+        assert!(entries
+            .filter_map(Result::ok)
+            .all(|entry| { !is_temporary_config(&entry.path()) }));
     }
 
     #[test]

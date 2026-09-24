@@ -5,6 +5,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, STILL_ACTIVE,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{
+    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+};
+
 const MARKER_SIDECAR_SUFFIX: &str = ".marker";
 const MAX_CRASH_RECORD_BYTES: usize = 4096;
 static MARKER_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -48,8 +57,21 @@ impl From<std::io::Error> for RecoveryError {
 }
 
 pub fn inspect(paths: &ConfigPaths) -> Result<RecoveryState, RecoveryError> {
+    let mut previous_run_incomplete = false;
+    for path in marker_paths(paths)? {
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(RecoveryError::new("inspect runtime marker", error)),
+        };
+        previous_run_incomplete = true;
+        match marker_liveness(marker_pid(&contents)) {
+            MarkerLiveness::Stale => remove_stale_marker(&path)?,
+            MarkerLiveness::Running | MarkerLiveness::Unknown => {}
+        }
+    }
     Ok(RecoveryState {
-        previous_run_incomplete: paths.marker_file.exists() || has_sidecar_marker(paths)?,
+        previous_run_incomplete,
     })
 }
 
@@ -128,10 +150,14 @@ fn marker_sidecar_path(paths: &ConfigPaths) -> PathBuf {
     ))
 }
 
-fn has_sidecar_marker(paths: &ConfigPaths) -> Result<bool, RecoveryError> {
+fn marker_paths(paths: &ConfigPaths) -> Result<Vec<PathBuf>, RecoveryError> {
+    let mut paths_to_inspect = Vec::new();
+    if paths.marker_file.exists() {
+        paths_to_inspect.push(paths.marker_file.clone());
+    }
     let entries = match std::fs::read_dir(&paths.root) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(paths_to_inspect),
         Err(error) => return Err(RecoveryError::new("inspect runtime markers", error)),
     };
     let legacy_name = paths
@@ -140,15 +166,81 @@ fn has_sidecar_marker(paths: &ConfigPaths) -> Result<bool, RecoveryError> {
         .and_then(|name| name.to_str())
         .unwrap_or("gui.running");
     let prefix = format!("{legacy_name}.");
-    Ok(entries.filter_map(Result::ok).any(|entry| {
+    paths_to_inspect.extend(entries.filter_map(Result::ok).filter_map(|entry| {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        name.starts_with(&prefix) && name.ends_with(MARKER_SIDECAR_SUFFIX)
-    }))
+        (name.starts_with(&prefix) && name.ends_with(MARKER_SIDECAR_SUFFIX)).then_some(entry.path())
+    }));
+    Ok(paths_to_inspect)
+}
+
+fn marker_pid(contents: &str) -> Option<u32> {
+    contents.lines().find_map(|line| {
+        line.strip_prefix("pid=")
+            .and_then(|value| value.trim().parse::<u32>().ok())
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkerLiveness {
+    Running,
+    Stale,
+    Unknown,
+}
+
+#[cfg(windows)]
+fn marker_liveness(pid: Option<u32>) -> MarkerLiveness {
+    let Some(pid) = pid else {
+        return MarkerLiveness::Unknown;
+    };
+    if pid == std::process::id() {
+        return MarkerLiveness::Running;
+    }
+
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return if GetLastError() == ERROR_INVALID_PARAMETER {
+                MarkerLiveness::Stale
+            } else {
+                MarkerLiveness::Unknown
+            };
+        }
+
+        let mut exit_code = 0;
+        let liveness = if GetExitCodeProcess(process, &mut exit_code) == 0 {
+            MarkerLiveness::Unknown
+        } else if exit_code == STILL_ACTIVE as u32 {
+            MarkerLiveness::Running
+        } else {
+            MarkerLiveness::Stale
+        };
+        let _ = CloseHandle(process);
+        liveness
+    }
+}
+
+#[cfg(not(windows))]
+fn marker_liveness(_pid: Option<u32>) -> MarkerLiveness {
+    MarkerLiveness::Unknown
+}
+
+fn remove_stale_marker(path: &Path) -> Result<(), RecoveryError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(RecoveryError::new("remove stale runtime marker", error)),
+    }
 }
 
 pub fn append_crash_record(path: &Path, summary: &str) -> std::io::Result<()> {
-    let prefix = format!("{}: ", unix_timestamp());
+    let current_thread = std::thread::current();
+    let thread_name = sanitized_summary(current_thread.name().unwrap_or("unnamed"), 256);
+    let thread_id = format!("{:?}", current_thread.id());
+    let prefix = format!(
+        "{}: thread={thread_name} thread_id={thread_id}: ",
+        unix_timestamp()
+    );
     let available_summary_bytes = MAX_CRASH_RECORD_BYTES
         .saturating_sub(prefix.len())
         .saturating_sub(1);
@@ -286,6 +378,35 @@ mod tests {
     }
 
     #[test]
+    fn current_process_marker_is_preserved_during_inspection() {
+        let root = TestRoot::new("current-process-marker");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let marker = create_marker(&paths).unwrap();
+        let marker_path = marker.path.clone();
+
+        assert!(inspect(&paths).unwrap().previous_run_incomplete);
+        assert!(marker_path.exists());
+
+        marker.remove().unwrap();
+    }
+
+    #[test]
+    fn exited_sidecar_marker_reports_recovery_and_is_cleaned() {
+        let root = TestRoot::new("stale-sidecar");
+        let paths = config_paths_from_root(root.path().to_owned());
+        std::fs::create_dir_all(root.path()).unwrap();
+        let stale_pid = u32::MAX;
+        let stale_path = root
+            .path()
+            .join(format!("gui.running.{stale_pid}.test.marker"));
+        std::fs::write(&stale_path, format!("pid={stale_pid}\nstarted_at=old\n")).unwrap();
+
+        assert!(inspect(&paths).unwrap().previous_run_incomplete);
+        assert!(!stale_path.exists());
+        assert!(!inspect(&paths).unwrap().previous_run_incomplete);
+    }
+
+    #[test]
     fn concurrent_instances_use_owned_sidecars_and_preserve_each_other() {
         let root = TestRoot::new("multi-instance");
         let paths = config_paths_from_root(root.path().to_owned());
@@ -326,6 +447,21 @@ mod tests {
         );
         marker.remove().unwrap();
         assert!(paths.marker_file.exists());
+    }
+
+    #[test]
+    fn exited_legacy_marker_is_cleaned_but_legacy_format_remains_supported() {
+        let root = TestRoot::new("stale-legacy-marker");
+        let paths = config_paths_from_root(root.path().to_owned());
+        std::fs::create_dir_all(root.path()).unwrap();
+        std::fs::write(
+            &paths.marker_file,
+            format!("pid={}\nstarted_at=old\n", u32::MAX),
+        )
+        .unwrap();
+
+        assert!(inspect(&paths).unwrap().previous_run_incomplete);
+        assert!(!paths.marker_file.exists());
     }
 
     #[test]
@@ -395,7 +531,10 @@ mod tests {
         let root = TestRoot::new("bounded-crash-log");
         std::fs::create_dir_all(root.path()).unwrap();
         let crash_log = root.path().join("gui-crash.log");
-        let summary = format!("prefix\0\t\r\n{}", "x".repeat(MAX_CRASH_RECORD_BYTES * 2));
+        let summary = format!(
+            "prefix\0\t\r\n{}",
+            "\u{4e16}".repeat(MAX_CRASH_RECORD_BYTES * 2)
+        );
 
         append_crash_record(&crash_log, &summary).unwrap();
 
@@ -404,5 +543,25 @@ mod tests {
         assert!(log.len() <= MAX_CRASH_RECORD_BYTES);
         assert!(log.lines().all(|line| !line.chars().any(char::is_control)));
         assert!(log.contains("prefix    "));
+    }
+
+    #[test]
+    fn crash_record_includes_current_thread_name_and_identifier() {
+        let root = TestRoot::new("thread-crash-log");
+        std::fs::create_dir_all(root.path()).unwrap();
+        let crash_log = root.path().join("gui-crash.log");
+        let handle = std::thread::Builder::new()
+            .name("task14-crash-thread".to_owned())
+            .spawn({
+                let crash_log = crash_log.clone();
+                move || append_crash_record(&crash_log, "thread summary")
+            })
+            .unwrap();
+        handle.join().unwrap().unwrap();
+
+        let log = std::fs::read_to_string(crash_log).unwrap();
+        assert!(log.contains("thread=task14-crash-thread"));
+        assert!(log.contains("thread_id=ThreadId("));
+        assert!(log.contains("thread summary"));
     }
 }

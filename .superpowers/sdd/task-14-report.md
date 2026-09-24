@@ -142,3 +142,42 @@ The workspace verification commands also passed with exit code `0`:
 The repair remains within the independent Windows user-mode GUI crate and
 does not modify the README, roadmap, historical Task4 report, or Task14
 design/plan.
+
+## Final Review Gap Fix: 2026-09-24
+
+This round closes the remaining marker, persistence-test, and crash-log gaps:
+
+- `inspect` now reads the PID from legacy `gui.running` and sidecar markers
+  on Windows. It preserves markers for the current or another running process,
+  preserves markers when liveness cannot be verified, and removes only markers
+  whose `OpenProcess`/`GetExitCodeProcess` result proves that the process has
+  exited. A stale marker still makes the current launch enter recovery; after
+  successful cleanup, the next launch can start normally. Legacy markers with
+  an unrecognized PID remain compatible and visible to recovery. Tests cover
+  current-process preservation, stale sidecar cleanup, stale legacy cleanup,
+  and legacy compatibility.
+- Configuration tests now inspect the real `gui.toml.*.tmp` pattern. A new
+  barrier-synchronized test calls `save_config` concurrently from 16 threads,
+  verifies every save succeeds, parses the final TOML, and confirms the
+  configuration directory has no temporary files left.
+- Crash records now include the current thread name and `ThreadId` alongside
+  the panic summary. The complete record remains capped at 4096 bytes, with
+  control characters replaced and truncation performed only at UTF-8 character
+  boundaries. The thread metadata and multibyte truncation are covered by
+  tests.
+
+The explicit stale-PID test uses `u32::MAX`, which Windows rejects as an
+invalid process identifier. Other `OpenProcess` failures are treated as
+unknown and preserved, so an access-limited running instance is never removed
+based on an uncertain result.
+
+Final verification for this round:
+
+```text
+cargo test -p rustnt-gui -- --nocapture: 32 passed, 0 failed
+cargo check --workspace --all-targets: pass
+cargo build --workspace --all-targets: pass
+cargo clippy --workspace --all-targets -- -D warnings: pass
+cargo fmt --all -- --check: pass
+git diff --check: pass
+```
