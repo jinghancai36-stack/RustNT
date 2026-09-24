@@ -97,10 +97,8 @@ impl eframe::App for RustNtApp {
             Self::apply_theme(&ctx, config.theme);
         }
         if ui.button("Save config").clicked() {
-            let result = {
-                let config = self.config();
-                save_config(&self.paths, &config)
-            };
+            let config = self.config().clone();
+            let result = save_config(&self.paths, &config);
             self.save_notice = Some(match result {
                 Ok(()) => "Configuration saved".to_owned(),
                 Err(error) => format!("Could not save configuration: {error}"),
@@ -112,19 +110,40 @@ impl eframe::App for RustNtApp {
     }
 }
 
-pub fn viewport_for(config: &GuiConfig, recovery: RecoveryState) -> egui::ViewportBuilder {
-    let config = if recovery.previous_run_incomplete {
-        GuiConfig::default()
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ViewportSettings {
+    pub(crate) width: f32,
+    pub(crate) height: f32,
+    pub(crate) position: Option<[f32; 2]>,
+}
+
+pub(crate) fn viewport_settings_for(
+    config: &GuiConfig,
+    recovery: RecoveryState,
+) -> ViewportSettings {
+    if recovery.previous_run_incomplete {
+        let defaults = GuiConfig::default();
+        ViewportSettings {
+            width: defaults.window_width,
+            height: defaults.window_height,
+            position: None,
+        }
     } else {
-        config.clone()
-    };
+        ViewportSettings {
+            width: config.window_width,
+            height: config.window_height,
+            position: config.window_x.zip(config.window_y).map(|(x, y)| [x, y]),
+        }
+    }
+}
+
+pub fn viewport_for(config: &GuiConfig, recovery: RecoveryState) -> egui::ViewportBuilder {
+    let settings = viewport_settings_for(config, recovery);
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("RustNT")
-        .with_inner_size([config.window_width, config.window_height]);
-    if !recovery.previous_run_incomplete {
-        if let (Some(x), Some(y)) = (config.window_x, config.window_y) {
-            viewport = viewport.with_position([x, y]);
-        }
+        .with_inner_size([settings.width, settings.height]);
+    if let Some(position) = settings.position {
+        viewport = viewport.with_position(position);
     }
     viewport
 }
@@ -149,7 +168,7 @@ mod tests {
     use crate::config::ThemeMode;
     use crate::recovery::RecoveryState;
 
-    use super::{recovery_label, theme_label};
+    use super::{recovery_label, theme_label, viewport_settings_for, ViewportSettings};
 
     #[test]
     fn theme_label_is_stable() {
@@ -170,6 +189,81 @@ mod tests {
                 previous_run_incomplete: true,
             }),
             "safe recovery mode"
+        );
+    }
+
+    #[test]
+    fn recovery_viewport_uses_default_dimensions_without_position() {
+        let loaded = crate::config::GuiConfig {
+            theme: ThemeMode::Light,
+            window_width: 1440.0,
+            window_height: 900.0,
+            window_x: Some(320.0),
+            window_y: Some(180.0),
+        };
+
+        assert_eq!(
+            viewport_settings_for(
+                &loaded,
+                RecoveryState {
+                    previous_run_incomplete: true,
+                },
+            ),
+            ViewportSettings {
+                width: crate::config::DEFAULT_WINDOW_WIDTH,
+                height: crate::config::DEFAULT_WINDOW_HEIGHT,
+                position: None,
+            }
+        );
+    }
+
+    #[test]
+    fn normal_viewport_uses_loaded_dimensions_and_position() {
+        let loaded = crate::config::GuiConfig {
+            theme: ThemeMode::Light,
+            window_width: 1440.0,
+            window_height: 900.0,
+            window_x: Some(320.0),
+            window_y: Some(180.0),
+        };
+
+        assert_eq!(
+            viewport_settings_for(
+                &loaded,
+                RecoveryState {
+                    previous_run_incomplete: false,
+                },
+            ),
+            ViewportSettings {
+                width: 1440.0,
+                height: 900.0,
+                position: Some([320.0, 180.0]),
+            }
+        );
+    }
+
+    #[test]
+    fn normal_viewport_does_not_force_missing_position() {
+        let loaded = crate::config::GuiConfig {
+            theme: ThemeMode::Dark,
+            window_width: 1024.0,
+            window_height: 768.0,
+            window_x: None,
+            window_y: None,
+        };
+
+        assert_eq!(
+            viewport_settings_for(
+                &loaded,
+                RecoveryState {
+                    previous_run_incomplete: false,
+                },
+            ),
+            ViewportSettings {
+                width: 1024.0,
+                height: 768.0,
+                position: None,
+            }
         );
     }
 }
