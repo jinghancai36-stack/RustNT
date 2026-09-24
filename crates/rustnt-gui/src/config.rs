@@ -1,5 +1,8 @@
 use std::fmt;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
@@ -9,6 +12,7 @@ pub const DEFAULT_WINDOW_HEIGHT: f32 = 640.0;
 
 const MIN_WINDOW_WIDTH: f32 = 320.0;
 const MIN_WINDOW_HEIGHT: f32 = 240.0;
+static TEMPORARY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThemeMode {
@@ -230,23 +234,60 @@ pub fn load_config(paths: &ConfigPaths) -> Result<(GuiConfig, ConfigLoad), Confi
 pub fn save_config(paths: &ConfigPaths, config: &GuiConfig) -> Result<(), ConfigError> {
     std::fs::create_dir_all(&paths.root)
         .map_err(|error| ConfigError::new("create configuration directory", error))?;
-    let temporary = paths.config_file.with_extension("toml.tmp");
     let encoded = match toml::to_string_pretty(&FileConfig::from_config(config)) {
         Ok(encoded) => encoded,
-        Err(error) => {
-            let _ = std::fs::remove_file(&temporary);
-            return Err(ConfigError::new("serialize configuration", error));
-        }
+        Err(error) => return Err(ConfigError::new("serialize configuration", error)),
     };
-    if let Err(error) = std::fs::write(&temporary, encoded) {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(ConfigError::new("write temporary configuration", error));
-    }
+    let temporary = write_temporary_config(&paths.config_file, &encoded)
+        .map_err(|error| ConfigError::new("write temporary configuration", error))?;
     if let Err(error) = replace_config_file(&temporary, &paths.config_file) {
         let _ = std::fs::remove_file(&temporary);
         return Err(ConfigError::new("replace configuration", error));
     }
     Ok(())
+}
+
+fn temporary_config_path(target: &Path) -> PathBuf {
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    let name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("gui.toml");
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let counter = TEMPORARY_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(
+        "{name}.{}.{}.{}.tmp",
+        std::process::id(),
+        timestamp,
+        counter
+    ))
+}
+
+fn write_temporary_config(target: &Path, encoded: &str) -> std::io::Result<PathBuf> {
+    for _ in 0..16 {
+        let temporary = temporary_config_path(target);
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        if let Err(error) = file.write_all(encoded.as_bytes()) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+        return Ok(temporary);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique temporary configuration path",
+    ))
 }
 
 #[cfg(not(windows))]
@@ -308,6 +349,7 @@ fn replace_existing_file(
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TestRoot(PathBuf);
@@ -390,6 +432,33 @@ mod tests {
         assert_eq!(actual, second);
         assert_eq!(load.notice, None);
         assert!(!paths.config_file.with_extension("toml.tmp").exists());
+    }
+
+    #[test]
+    fn concurrent_temporary_config_paths_are_unique_in_the_config_directory() {
+        let root = TestRoot::new("temporary-paths");
+        let paths = Arc::new(config_paths_from_root(root.path().to_owned()));
+        let handles = (0..32)
+            .map(|_| {
+                let paths = Arc::clone(&paths);
+                std::thread::spawn(move || temporary_config_path(&paths.config_file))
+            })
+            .collect::<Vec<_>>();
+        let temporary_paths = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+
+        let unique_paths = temporary_paths
+            .iter()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique_paths.len(), temporary_paths.len());
+        assert!(temporary_paths
+            .iter()
+            .all(|path| path.parent() == paths.config_file.parent()));
+        assert!(temporary_paths
+            .iter()
+            .all(|path| path != &paths.config_file.with_extension("toml.tmp")));
     }
 
     #[test]

@@ -1,7 +1,13 @@
 use crate::config::ConfigPaths;
 use std::fmt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const MARKER_SIDECAR_SUFFIX: &str = ".marker";
+const MAX_CRASH_RECORD_BYTES: usize = 4096;
+static MARKER_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecoveryState {
@@ -43,7 +49,7 @@ impl From<std::io::Error> for RecoveryError {
 
 pub fn inspect(paths: &ConfigPaths) -> Result<RecoveryState, RecoveryError> {
     Ok(RecoveryState {
-        previous_run_incomplete: paths.marker_file.exists(),
+        previous_run_incomplete: paths.marker_file.exists() || has_sidecar_marker(paths)?,
     })
 }
 
@@ -53,13 +59,31 @@ pub fn create_marker(paths: &ConfigPaths) -> Result<RuntimeMarker, RecoveryError
     let contents = format!(
         "pid={}\nstarted_at={}\n",
         std::process::id(),
-        unix_timestamp()
+        unix_timestamp_nanos()
     );
-    std::fs::write(&paths.marker_file, contents)
-        .map_err(|error| RecoveryError::new("write runtime marker", error))?;
-    Ok(RuntimeMarker {
-        path: paths.marker_file.clone(),
-    })
+    for _ in 0..16 {
+        let path = marker_sidecar_path(paths);
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(RecoveryError::new("write runtime marker", error));
+            }
+        };
+        if let Err(error) = file.write_all(contents.as_bytes()) {
+            let _ = std::fs::remove_file(&path);
+            return Err(RecoveryError::new("write runtime marker", error));
+        }
+        return Ok(RuntimeMarker { path });
+    }
+    Err(RecoveryError::new(
+        "write runtime marker",
+        "could not allocate a unique runtime marker path",
+    ))
 }
 
 impl RuntimeMarker {
@@ -79,19 +103,80 @@ fn unix_timestamp() -> u64 {
         .as_secs()
 }
 
+fn unix_timestamp_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+fn marker_sidecar_path(paths: &ConfigPaths) -> PathBuf {
+    let parent = paths.marker_file.parent().unwrap_or_else(|| Path::new("."));
+    let name = paths
+        .marker_file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("gui.running");
+    let timestamp = unix_timestamp_nanos();
+    let counter = MARKER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(
+        "{name}.{}.{}.{}{}",
+        std::process::id(),
+        timestamp,
+        counter,
+        MARKER_SIDECAR_SUFFIX
+    ))
+}
+
+fn has_sidecar_marker(paths: &ConfigPaths) -> Result<bool, RecoveryError> {
+    let entries = match std::fs::read_dir(&paths.root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(RecoveryError::new("inspect runtime markers", error)),
+    };
+    let legacy_name = paths
+        .marker_file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("gui.running");
+    let prefix = format!("{legacy_name}.");
+    Ok(entries.filter_map(Result::ok).any(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        name.starts_with(&prefix) && name.ends_with(MARKER_SIDECAR_SUFFIX)
+    }))
+}
+
 pub fn append_crash_record(path: &Path, summary: &str) -> std::io::Result<()> {
-    use std::io::Write;
+    let prefix = format!("{}: ", unix_timestamp());
+    let available_summary_bytes = MAX_CRASH_RECORD_BYTES
+        .saturating_sub(prefix.len())
+        .saturating_sub(1);
+    let summary = sanitized_summary(summary, available_summary_bytes);
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
-    writeln!(
-        file,
-        "{}: {}",
-        unix_timestamp(),
-        summary.replace(['\r', '\n'], " ")
-    )?;
+    file.write_all(prefix.as_bytes())?;
+    file.write_all(summary.as_bytes())?;
+    file.write_all(b"\n")?;
     Ok(())
+}
+
+fn sanitized_summary(summary: &str, max_bytes: usize) -> String {
+    let mut sanitized = String::with_capacity(max_bytes.min(summary.len()));
+    for character in summary.chars() {
+        let character = if character.is_control() {
+            ' '
+        } else {
+            character
+        };
+        if sanitized.len() + character.len_utf8() > max_bytes {
+            break;
+        }
+        sanitized.push(character);
+    }
+    sanitized
 }
 
 type PanicHook = Box<dyn for<'a> Fn(&std::panic::PanicHookInfo<'a>) + Send + Sync + 'static>;
@@ -186,17 +271,61 @@ mod tests {
     fn marker_is_detected_and_removed_only_explicitly() {
         let root = TestRoot::new("marker");
         let paths = config_paths_from_root(root.path().to_owned());
-        std::fs::create_dir_all(root.path()).unwrap();
-        std::fs::write(&paths.marker_file, "old_pid=123\nstarted_at=old\n").unwrap();
-        assert!(inspect(&paths).unwrap().previous_run_incomplete);
         let marker = create_marker(&paths).unwrap();
-        assert!(paths.marker_file.exists());
+        assert!(marker.path.exists());
+        let leaked_marker_path = marker.path.clone();
         drop(marker);
-        assert!(paths.marker_file.exists());
+        assert!(inspect(&paths).unwrap().previous_run_incomplete);
+        std::fs::remove_file(leaked_marker_path).unwrap();
 
         let marker = create_marker(&paths).unwrap();
+        let marker_path = marker.path.clone();
         marker.remove().unwrap();
-        assert!(!paths.marker_file.exists());
+        assert!(!marker_path.exists());
+        assert!(!inspect(&paths).unwrap().previous_run_incomplete);
+    }
+
+    #[test]
+    fn concurrent_instances_use_owned_sidecars_and_preserve_each_other() {
+        let root = TestRoot::new("multi-instance");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let first = create_marker(&paths).unwrap();
+        let second = create_marker(&paths).unwrap();
+
+        assert_ne!(first.path, second.path);
+        assert!(first.path.exists());
+        assert!(second.path.exists());
+        assert!(inspect(&paths).unwrap().previous_run_incomplete);
+
+        let first_path = first.path.clone();
+        first.remove().unwrap();
+        assert!(!first_path.exists());
+        assert!(second.path.exists());
+        assert!(inspect(&paths).unwrap().previous_run_incomplete);
+
+        let second_path = second.path.clone();
+        second.remove().unwrap();
+        assert!(!second_path.exists());
+        assert!(!inspect(&paths).unwrap().previous_run_incomplete);
+    }
+
+    #[test]
+    fn legacy_marker_is_detected_without_being_overwritten_or_removed() {
+        let root = TestRoot::new("legacy-marker");
+        let paths = config_paths_from_root(root.path().to_owned());
+        std::fs::create_dir_all(root.path()).unwrap();
+        let legacy_contents = "pid=old\nstarted_at=old\n";
+        std::fs::write(&paths.marker_file, legacy_contents).unwrap();
+
+        assert!(inspect(&paths).unwrap().previous_run_incomplete);
+        let marker = create_marker(&paths).unwrap();
+        assert_ne!(marker.path, paths.marker_file);
+        assert_eq!(
+            std::fs::read_to_string(&paths.marker_file).unwrap(),
+            legacy_contents
+        );
+        marker.remove().unwrap();
+        assert!(paths.marker_file.exists());
     }
 
     #[test]
@@ -214,6 +343,7 @@ mod tests {
         std::fs::create_dir_all(root.path()).unwrap();
         let paths = config_paths_from_root(root.path().to_owned());
         let marker = create_marker(&paths).unwrap();
+        let marker_path = marker.path.clone();
         let previous_calls = Arc::new(AtomicUsize::new(0));
         let calls = Arc::clone(&previous_calls);
         let hook = make_panic_hook(
@@ -228,7 +358,7 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(previous_calls.load(Ordering::SeqCst), 1);
-        assert!(paths.marker_file.exists());
+        assert!(marker_path.exists());
         drop(marker);
     }
 
@@ -238,6 +368,7 @@ mod tests {
         let root = TestRoot::new("hook-line");
         let paths = config_paths_from_root(root.path().to_owned());
         let marker = create_marker(&paths).unwrap();
+        let marker_path = marker.path.clone();
         let previous_calls = Arc::new(AtomicUsize::new(0));
         let calls = Arc::clone(&previous_calls);
         let hook = make_panic_hook(
@@ -255,7 +386,23 @@ mod tests {
         let log = std::fs::read_to_string(&paths.crash_log).unwrap();
         assert_eq!(log.lines().count(), 1);
         assert!(log.contains("first  second third "));
-        assert!(paths.marker_file.exists());
+        assert!(marker_path.exists());
         drop(marker);
+    }
+
+    #[test]
+    fn crash_record_sanitizes_controls_and_caps_record_length() {
+        let root = TestRoot::new("bounded-crash-log");
+        std::fs::create_dir_all(root.path()).unwrap();
+        let crash_log = root.path().join("gui-crash.log");
+        let summary = format!("prefix\0\t\r\n{}", "x".repeat(MAX_CRASH_RECORD_BYTES * 2));
+
+        append_crash_record(&crash_log, &summary).unwrap();
+
+        let log = std::fs::read_to_string(crash_log).unwrap();
+        assert_eq!(log.lines().count(), 1);
+        assert!(log.len() <= MAX_CRASH_RECORD_BYTES);
+        assert!(log.lines().all(|line| !line.chars().any(char::is_control)));
+        assert!(log.contains("prefix    "));
     }
 }

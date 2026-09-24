@@ -97,3 +97,48 @@ and relaunch checks were completed with the dedicated test process.
 RustNT GUI remains a normal Windows user-mode client. Task14 does not alter
 the Windows kernel, drivers, services, Shell behavior, or the existing service
 authorization boundary.
+
+## Final Review Fix: 2026-09-24
+
+Addressed the three Important findings from the final review diff
+`review-a219963..7f13321.diff`:
+
+- `save_config` now creates each temporary TOML file in the configuration
+  directory with a process ID, nanosecond timestamp, and atomic counter in its
+  name. `create_new` prevents accidental reuse, and the existing Windows
+  `ReplaceFileW` replacement path remains unchanged. A concurrent path
+  uniqueness regression test covers the no-shared-`gui.toml.tmp` behavior.
+- Runtime markers are now per-instance sidecars named from `gui.running` plus
+  process ID, nanosecond timestamp, and atomic counter. `inspect` recognizes
+  both the legacy `gui.running` sentinel and new sidecars. New instances never
+  overwrite the legacy file, and `RuntimeMarker::remove` removes only its own
+  sidecar, so concurrent instances do not delete each other's records and no
+  single-instance lock is introduced. Tests cover two-instance lifecycle and
+  legacy marker compatibility.
+- Crash records are capped at `4096` bytes per record. All control characters
+  in the panic summary are replaced with spaces before byte-safe truncation.
+  The bounded payload and control-character behavior has a regression test.
+
+The final focused command for this repair is:
+
+```text
+cargo test -p rustnt-gui -- --nocapture
+```
+
+It passed with 27 tests and 0 failures. The GUI focused Clippy check,
+formatting check, and diff check also passed:
+
+```text
+cargo clippy -p rustnt-gui --all-targets -- -D warnings
+cargo fmt --all -- --check
+git diff --check
+```
+
+The workspace verification commands also passed with exit code `0`:
+`cargo check --workspace --all-targets`,
+`cargo build --workspace --all-targets`, and
+`cargo clippy --workspace --all-targets -- -D warnings`.
+
+The repair remains within the independent Windows user-mode GUI crate and
+does not modify the README, roadmap, historical Task4 report, or Task14
+design/plan.
