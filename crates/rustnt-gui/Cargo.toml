@@ -1,0 +1,15 @@
+[package]
+name = "rustnt-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rustnt-gui"
+path = "src/main.rs"
+
+[dependencies]
+eframe.workspace = true
+serde.workspace = true
+toml.workspace = true
+windows-sys.workspace = true

@@ -5,6 +5,7 @@ members = [
     "crates/rustnt-bench",
     "crates/rustnt-service",
     "crates/rustnt-task09-target",
+    "crates/rustnt-gui",
 ]
 resolver = "2"
 
@@ -14,6 +15,9 @@ license = "MIT"
 version = "0.1.0"
 
 [workspace.dependencies]
+eframe = "0.36.2"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.6+spec-1.1.0"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Diagnostics_ToolHelp",

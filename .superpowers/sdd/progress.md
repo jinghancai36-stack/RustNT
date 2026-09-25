@@ -118,3 +118,12 @@ produce typed audit events. Rate-limited events omit the unvalidated requested P
   the WTS zero-count allocation fix.
 - Commits: `b289838`, `3446479`, `4851edf`.
 - Task13: complete; next capability is Task14 GUI foundation.
+
+## Task 14 GUI Foundation
+
+- Task 1: complete (commits 81cf714..aa4a552, review clean). Added the independent GUI workspace crate, pinned eframe/serde/toml dependencies, validated TOML configuration with injected temporary paths, and fixed Windows repeated-save replacement with a regression test.
+- Task 2: complete (commits 9b1bc53..81b8e51, review clean). Added the runtime marker lifecycle, panic hook and bounded crash-log behavior, with tests for explicit cleanup, panic preservation, hook delegation, and write failures.
+- Task 3: complete (commits 948872f..c86b39e, review clean). Added the eframe first screen, theme switching, recovery/configuration notices, explicit save action, viewport initialization, and viewport snapshot tests.
+- Task 4: complete (commits 1117cf5..f50de9a, review clean). Wired APPDATA startup, stale-run recovery, eframe launch, normal-exit persistence, marker cleanup, GUI error handling, and README usage documentation.
+- Task 5: complete. Full workspace verification passed: 149 tests passed, workspace check/build/Clippy/format/diff checks all exited 0. Real isolated `cargo run -p rustnt-gui` startup created a responsive `RustNT` window and marker; dedicated forced-termination and relaunch recovery checks passed. Interactive theme/save/normal-close clicks were skipped because the current CUA session exposed no bindable native application; details are in `.superpowers/sdd/task-14-report.md`.
+- Task14 is complete at implementation commit `f50de9a`; the next capability is Task15 desktop interaction components.
