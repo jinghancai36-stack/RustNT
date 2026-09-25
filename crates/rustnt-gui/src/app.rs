@@ -88,6 +88,24 @@ impl RustNtApp {
         self.navigation.current_page = page;
     }
 
+    fn select_switcher_page(&mut self, page: PageId) {
+        self.select_page(page);
+        self.navigation.switcher_open = false;
+    }
+
+    fn open_notification_panel(&mut self) {
+        self.notifications_open = true;
+        self.notifications.mark_all_read();
+    }
+
+    fn clear_notifications(&mut self) {
+        self.notifications.clear();
+    }
+
+    fn close_notification_panel(&mut self) {
+        self.notifications_open = false;
+    }
+
     fn record_save_result(&mut self, result: Result<(), ConfigError>) {
         match result {
             Ok(()) => {
@@ -135,8 +153,8 @@ impl RustNtApp {
         if escape {
             if self.navigation.switcher_open {
                 self.navigation.switcher_open = false;
-            } else {
-                self.notifications.clear();
+            } else if !self.notifications_open {
+                self.clear_notifications();
             }
         }
     }
@@ -157,8 +175,7 @@ impl RustNtApp {
                     ))
                     .clicked()
                 {
-                    self.notifications_open = true;
-                    self.notifications.mark_all_read();
+                    self.open_notification_panel();
                 }
             });
         });
@@ -245,8 +262,7 @@ impl RustNtApp {
                         )
                         .clicked()
                     {
-                        self.select_page(*page);
-                        self.navigation.switcher_open = false;
+                        self.select_switcher_page(*page);
                     }
                 }
             });
@@ -267,7 +283,10 @@ impl RustNtApp {
             .resizable(true)
             .show(ctx, |ui| {
                 if ui.button("Clear notifications").clicked() {
-                    self.notifications.clear();
+                    self.clear_notifications();
+                }
+                if ui.button("Close notifications").clicked() {
+                    self.close_notification_panel();
                 }
                 egui::ScrollArea::vertical()
                     .max_height(280.0)
@@ -286,7 +305,7 @@ impl RustNtApp {
                     });
             });
         if !open {
-            self.notifications_open = false;
+            self.close_notification_panel();
         }
     }
 }
@@ -380,6 +399,8 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
+    use eframe::egui;
+
     use crate::config::{config_paths_from_root, GuiConfig, ThemeMode};
     use crate::navigation::PageId;
     use crate::recovery::RecoveryState;
@@ -398,6 +419,55 @@ mod tests {
             },
             config_notice,
         )
+    }
+
+    fn run_input(app: &mut RustNtApp, context: &egui::Context, input: egui::RawInput) {
+        let output = context.run_ui(input, |ui| app.handle_shortcuts(ui.ctx()));
+        output.drop_without_applying_deltas();
+    }
+
+    fn run_top_frame(app: &mut RustNtApp, context: &egui::Context, input: egui::RawInput) {
+        let output = context.run_ui(input, |ui| {
+            app.show_top_panel(ui, ThemeMode::Dark);
+            app.show_notifications(ui.ctx());
+        });
+        output.drop_without_applying_deltas();
+    }
+
+    fn pointer_input(position: egui::Pos2, pressed: bool) -> egui::RawInput {
+        egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn click_top_rect(app: &mut RustNtApp, context: &egui::Context, rect: egui::Rect) {
+        run_top_frame(app, context, pointer_input(rect.center(), true));
+        run_top_frame(app, context, pointer_input(rect.center(), false));
+    }
+
+    fn key_input(key: egui::Key, modifiers: egui::Modifiers) -> egui::RawInput {
+        egui::RawInput {
+            events: vec![
+                egui::Event::ModifiersChanged(modifiers),
+                egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                },
+            ],
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -419,6 +489,99 @@ mod tests {
             app.notifications.notifications()[0].message,
             "Invalid configuration"
         );
+    }
+
+    #[test]
+    fn ctrl_k_from_egui_input_opens_the_switcher() {
+        let mut app = test_app(None);
+        let context = egui::Context::default();
+
+        run_input(
+            &mut app,
+            &context,
+            key_input(egui::Key::K, egui::Modifiers::CTRL),
+        );
+
+        assert!(app.navigation.switcher_open);
+    }
+
+    #[test]
+    fn ctrl_2_from_egui_input_routes_to_system_monitor() {
+        let mut app = test_app(None);
+        let context = egui::Context::default();
+
+        run_input(
+            &mut app,
+            &context,
+            key_input(egui::Key::Num2, egui::Modifiers::CTRL),
+        );
+
+        assert_eq!(app.navigation.current_page, PageId::SystemMonitor);
+    }
+
+    #[test]
+    fn esc_does_not_clear_notifications_while_notification_panel_is_open() {
+        let mut app = test_app(None);
+        app.notifications
+            .push(crate::notifications::NotificationKind::Info, "keep me");
+        app.notifications_open = true;
+        let context = egui::Context::default();
+
+        run_input(
+            &mut app,
+            &context,
+            key_input(egui::Key::Escape, egui::Modifiers::NONE),
+        );
+
+        assert!(app.notifications_open);
+        assert_eq!(app.notifications.notifications().len(), 1);
+    }
+
+    #[test]
+    fn switcher_selection_changes_page_and_closes_switcher() {
+        let mut app = test_app(None);
+        app.navigation.switcher_open = true;
+
+        app.select_switcher_page(PageId::SystemMonitor);
+
+        assert_eq!(app.navigation.current_page, PageId::SystemMonitor);
+        assert!(!app.navigation.switcher_open);
+    }
+
+    #[test]
+    fn notification_panel_actions_have_explicit_open_clear_and_close_transitions() {
+        let mut app = test_app(None);
+        app.notifications
+            .push(crate::notifications::NotificationKind::Info, "read me");
+
+        app.open_notification_panel();
+        assert!(app.notifications_open);
+        assert_eq!(app.notifications.unread_count(), 0);
+
+        app.clear_notifications();
+        assert!(app.notifications.notifications().is_empty());
+
+        app.close_notification_panel();
+        assert!(!app.notifications_open);
+    }
+
+    #[test]
+    fn notification_entry_opens_panel_and_marks_notifications_read_through_egui() {
+        let mut app = test_app(None);
+        app.notifications
+            .push(crate::notifications::NotificationKind::Info, "read me");
+        let context = egui::Context::default();
+
+        run_top_frame(&mut app, &context, egui::RawInput::default());
+        let notification_button = context
+            .interactive_rects_last_pass()
+            .into_iter()
+            .last()
+            .expect("notification entry should be interactive");
+        click_top_rect(&mut app, &context, notification_button);
+
+        assert!(app.notifications_open);
+        assert_eq!(app.notifications.unread_count(), 0);
     }
 
     #[test]
