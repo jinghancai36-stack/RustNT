@@ -250,3 +250,43 @@ The commands continue to show the pre-existing Cargo warning that the
 `toml` dependency version contains ignored semver metadata. Only
 `crates/rustnt-gui/src/recovery.rs` and this report were changed in this
 repair.
+
+## Final Review Closeout: 2026-09-24
+
+Added a Windows-only real-process integration test in `recovery.rs`. It starts
+`cmd.exe /C timeout /T 5 /NOBREAK >NUL`, writes the child PID to a legacy-format
+marker, verifies `inspect` preserves the marker while the child is running, then
+waits for the child and verifies the next `inspect` removes the stale marker.
+The test uses an RAII child guard that kills and waits for the child during every
+early return or assertion unwind. If `cmd.exe` cannot be started, it prints an
+explicit skip message and returns without claiming coverage.
+
+The Task14 spec and plan now make the implemented recovery contract explicit:
+Windows PID liveness, creation-time matching to prevent PID reuse, preservation
+when liveness is unknown, per-instance sidecar ownership, legacy marker
+compatibility, and multi-instance inspection convergence. The former contract
+that declined to inspect PID liveness was removed.
+
+The final focused GUI test command passed with **36 passed, 0 failed** on the
+Windows MSVC toolchain. The new integration test was also run three consecutive
+times and passed each time. The final verification command set for this
+closeout is:
+
+```text
+cargo test -p rustnt-gui -- --nocapture
+cargo check --workspace --all-targets
+cargo build --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
+git diff --check
+```
+
+One earlier full GUI test invocation hit the pre-existing concurrent Windows
+configuration replacement test with `ReplaceFileW` error 1175. The focused
+test passed in ten consecutive reruns, and the complete GUI test suite passed
+again with 36/36 after that transient failure. The error is retained as a
+known Windows filesystem concurrency concern; this closeout does not change
+configuration replacement code.
+
+README, roadmap, progress, and the historical Task4 report remain unchanged by
+this closeout.

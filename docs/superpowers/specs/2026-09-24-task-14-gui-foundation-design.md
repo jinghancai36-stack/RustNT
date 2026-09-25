@@ -99,7 +99,7 @@ workspace 的依赖配置中。GUI 不引入第二套窗口后端。
 
 ```text
 %APPDATA%\\RustNT\\gui.toml
-%APPDATA%\\RustNT\\gui.running
+%APPDATA%\\RustNT\\gui.running (legacy) and %APPDATA%\\RustNT\\gui.running.*.marker (per-instance sidecars)
 %APPDATA%\\RustNT\\gui-crash.log
 ```
 
@@ -137,9 +137,12 @@ API 确定是否能可靠恢复位置。
 启动顺序固定为：
 
 1. 解析 `%APPDATA%\\RustNT`，创建目录。
-2. 检查 `gui.running` 是否存在，并把结果保存为 `previous_run_incomplete`。
+2. 检查 legacy `gui.running` 和当前实例 sidecar 运行标记，并把结果保存为
+   `previous_run_incomplete`。Windows 上按 marker 的 PID 判断进程是否仍然存活；
+   marker 含 `creation_time_100ns` 时还必须匹配该 PID 当前进程的创建时间。
 3. 读取并校验 `gui.toml`。
-4. 写入当前进程的 `gui.running`，内容至少包含 PID 和启动时间，写入失败则终止启动。
+4. 写入当前进程独占的 sidecar 运行标记，内容至少包含 PID、启动时间和 Windows
+   进程创建时间；写入失败则终止启动。
 5. 如果存在上一轮运行标记，进入安全恢复状态：使用安全默认窗口尺寸和主题，忽略持久化
    的窗口几何信息，并在首屏显示恢复提示。
 6. 创建 eframe 窗口并运行应用。
@@ -159,8 +162,17 @@ panic hook 执行以下操作：
 - 不在 hook 中调用可能再次 panic 的 GUI 或复杂日志逻辑。
 - 崩溃日志写入失败时忽略该写入错误，保留原始 panic 行为。
 
-Task14 不尝试判断运行标记对应的 PID 是否仍然存活，也不实现单实例锁。若用户在
-已有 GUI 运行时再次启动，第二个实例按恢复状态启动；并发实例限制留给后续任务。
+运行标记契约如下：
+
+- Windows 上 `inspect` 对 marker PID 执行非阻塞 liveness 检查。明确已退出的进程对应
+  marker 会被清理；无法确认状态时保留 marker，避免因权限或瞬时错误误删运行实例。
+- marker 含 `creation_time_100ns` 时，PID 存活还不够；只有 PID 与创建时间同时匹配
+  才能保留 marker。创建时间不匹配表示 PID 已复用，marker 必须被清理。
+- 新实例只创建自己的 sidecar，并只删除自己的 sidecar。legacy `gui.running` 仍可被
+  读取以保持兼容，但不会被新实例覆盖；多个 GUI 实例可以并行运行，`inspect` 会收敛
+  所有可见 marker 的状态，不实现单实例锁。
+- 不含创建时间的 legacy marker 按兼容规则处理：运行中的 PID 保留，已退出或无效的
+  PID 清理；无法确认 liveness 时保留。
 
 ## 7. 首屏行为
 
@@ -195,6 +207,10 @@ Shell 注册表或启动项。
 - 已有运行标记时判定为上次未完成运行。
 - 创建运行标记后能够读取诊断字段。
 - 正常清理会删除运行标记。
+- Windows 上真实启动非当前进程，验证其运行中 marker 保留、退出后 stale marker 清理；
+  无法启动 `cmd.exe` 时测试必须明确 skip/return。
+- Windows 上覆盖 PID liveness、creation-time 不匹配清理、sidecar ownership 和多实例
+  收敛；无法确认 liveness 时 marker 保留。
 - 崩溃日志写入失败不会让清理逻辑 panic。
 
 测试使用注入的临时应用数据目录，不读写真实用户 `%APPDATA%`，避免测试之间互相影响。
@@ -222,7 +238,10 @@ Task14 满足以下条件才算完成：
 - GUI 可以在 Windows MSVC 环境编译和启动。
 - 首屏具备状态展示、主题切换和配置保存能力。
 - 配置路径固定为 `%APPDATA%\\RustNT\\gui.toml`，解析失败有安全回退。
-- 运行标记能区分正常退出和未完成运行。
+- 运行标记通过 Windows PID liveness 和 creation-time 检查区分运行中、stale 和无法
+  确认的状态；stale marker 会被清理，无法确认时保留。
+- 每个 GUI 实例拥有独立 sidecar，正常清理只删除自身 marker；多实例检查能够收敛而
+  不互相覆盖或误删。
 - 异常退出后下一次启动进入安全恢复状态并给出可见提示。
 - 正常退出会删除运行标记，配置保存失败不会留下错误恢复状态。
 - 新增测试通过，既有 workspace 测试、格式检查和 Clippy 不回退。

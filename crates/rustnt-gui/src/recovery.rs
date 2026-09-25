@@ -631,6 +631,79 @@ mod tests {
         assert!(!paths.marker_file.exists());
     }
 
+    #[cfg(windows)]
+    struct ChildGuard {
+        child: std::process::Child,
+    }
+
+    #[cfg(windows)]
+    impl ChildGuard {
+        fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+            self.child.try_wait()
+        }
+
+        fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+            self.child.wait()
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let running = self.child.try_wait().ok().flatten().is_none();
+            if running {
+                let _ = self.child.kill();
+            }
+            let _ = self.child.wait();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn inspect_preserves_running_child_marker_and_cleans_it_after_exit() {
+        use std::process::{Command, Stdio};
+
+        let root = TestRoot::new("live-child-marker");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let child = Command::new("cmd.exe")
+            .args(["/C", "timeout /T 5 /NOBREAK >NUL"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        let child = match child {
+            Ok(child) => child,
+            Err(error) => {
+                eprintln!(
+                    "skipped: could not start cmd.exe for recovery integration test: {error}"
+                );
+                return;
+            }
+        };
+        let mut child = ChildGuard { child };
+
+        if child.try_wait().unwrap().is_some() {
+            eprintln!("skipped: cmd.exe exited before the marker could be inspected");
+            return;
+        }
+
+        std::fs::create_dir_all(root.path()).unwrap();
+        std::fs::write(
+            &paths.marker_file,
+            format!("pid={}\nstarted_at=integration-test\n", child.child.id()),
+        )
+        .unwrap();
+
+        assert!(inspect(&paths).unwrap().previous_run_incomplete);
+        assert!(paths.marker_file.exists());
+
+        child.wait().unwrap();
+
+        assert!(inspect(&paths).unwrap().previous_run_incomplete);
+        assert!(!paths.marker_file.exists());
+        assert!(!inspect(&paths).unwrap().previous_run_incomplete);
+    }
+
     #[test]
     fn failed_crash_log_append_is_reported_without_panicking() {
         let root = TestRoot::new("crash-log");

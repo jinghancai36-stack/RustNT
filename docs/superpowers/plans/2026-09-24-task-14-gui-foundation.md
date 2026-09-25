@@ -13,8 +13,15 @@
 - The GUI is Windows-only, user-mode, and runs as a normal user process.
 - Use `eframe` as the single native window/event-loop host; do not add a second GUI backend.
 - Store settings in `%APPDATA%\\RustNT\\gui.toml`.
-- Store the runtime marker in `%APPDATA%\\RustNT\\gui.running` and the bounded crash log in `%APPDATA%\\RustNT\\gui-crash.log`.
+- Store the legacy-compatible runtime marker family under `%APPDATA%\\RustNT\\gui.running*` and
+  the bounded crash log in `%APPDATA%\\RustNT\\gui-crash.log`.
 - Missing or malformed configuration uses safe defaults and reports the fallback in the first screen.
+- On Windows, inspect marker PID liveness without blocking. Remove markers proven stale; preserve
+  markers when liveness is unknown. A marker creation timestamp must match the PID's current
+  process creation timestamp, otherwise the marker is stale and is removed.
+- Each instance creates and owns a unique sidecar marker and removes only that sidecar. Legacy
+  `gui.running` remains readable but is never overwritten by a new instance. Multiple instances
+  are allowed and inspection converges their marker state; no single-instance lock is used.
 - A pre-existing runtime marker starts the GUI in safe recovery mode with default theme and window geometry.
 - Normal event-loop return saves configuration and removes the runtime marker; panic leaves the marker in place.
 - GUI code must not call the LocalSystem service, add a Named Pipe command, execute arbitrary commands, request elevation, or modify Windows Shell state.
@@ -31,10 +38,10 @@
 - Create `C:\Users\ceeses\Desktop\RustNT\crates\rustnt-gui\src\config.rs`: path model, public GUI configuration, TOML conversion, validation, atomic save, and configuration tests.
 - Create `C:\Users\ceeses\Desktop\RustNT\crates\rustnt-gui\src\recovery.rs`: runtime-marker lifecycle, crash-log append helper, panic-hook installation, and recovery tests.
 - Create `C:\Users\ceeses\Desktop\RustNT\crates\rustnt-gui\src\app.rs`: `eframe::App`, first-screen controls, theme application, shared configuration updates, and user-visible status messages.
-- Modify `C:\Users\ceeses\Desktop\RustNT\README.md`: document how to launch the GUI and its user-mode/configuration boundary.
-- Modify `C:\Users\ceeses\Desktop\RustNT\docs\roadmap.md`: mark Task14 complete only after all verification evidence exists and set Task15 as the next capability.
-- Create `C:\Users\ceeses\Desktop\RustNT\.superpowers\sdd\task-14-report.md`: record actual test/build/smoke outputs and known platform boundaries.
-- Modify `C:\Users\ceeses\Desktop\RustNT\.superpowers\sdd\progress.md`: append the Task14 completion ledger after implementation and review.
+- Existing `C:\Users\ceeses\Desktop\RustNT\README.md` records the GUI launch and user-mode/configuration boundary; it is protected for this closeout.
+- Existing `C:\Users\ceeses\Desktop\RustNT\docs\roadmap.md` records project status; it is protected for this closeout.
+- Create `C:\Users\ceeses\Desktop\RustNT\.superpowers\sdd\task-14-report.md`: record actual test/build/smoke outputs, marker liveness evidence, and known platform boundaries.
+- Existing `C:\Users\ceeses\Desktop\RustNT\.superpowers\sdd\progress.md` is protected for this closeout.
 
 ## Interfaces
 
@@ -374,7 +381,9 @@ Expected result: one commit containing only workspace setup and configuration co
 
 **Consumes:** `ConfigPaths` and `ConfigError` from Task 1.
 
-**Produces:** A marker lifecycle that reports stale state, leaves the marker on panic, and removes it only on the normal return path.
+**Produces:** A marker lifecycle that reports incomplete state, performs Windows PID
+liveness and creation-time checks, cleans proven stale markers, preserves unknown states,
+and removes only the owning sidecar on the normal return path.
 
 - [ ] **Step 1: Write failing marker and crash-log tests**
 
@@ -394,12 +403,17 @@ fn marker_is_detected_and_removed_only_explicitly() {
     let root = test_root("marker");
     let paths = config_paths_from_root(root.clone());
     std::fs::create_dir_all(&root).unwrap();
-    std::fs::write(&paths.marker_file, "old_pid=123\nstarted_at=old\n").unwrap();
+    std::fs::write(
+        &paths.marker_file,
+        format!("pid={}\nstarted_at=old\n", std::process::id()),
+    )
+    .unwrap();
     assert_eq!(inspect(&paths).unwrap().previous_run_incomplete, true);
     let marker = create_marker(&paths).unwrap();
-    assert!(paths.marker_file.exists());
+    assert!(marker.path.exists());
     marker.remove().unwrap();
-    assert!(!paths.marker_file.exists());
+    assert!(!marker.path.exists());
+    assert!(paths.marker_file.exists());
     remove_test_root(root);
 }
 
@@ -413,6 +427,14 @@ fn failed_crash_log_append_is_reported_without_panicking() {
 }
 ```
 
+On Windows, add a real cross-process test that starts a short-lived
+`cmd.exe /C timeout ...` child, writes its PID to a marker, verifies the marker
+is retained while the child is running, then waits for the child and verifies
+the next inspection removes the stale marker. The test must own the child with
+an RAII cleanup guard that terminates and waits on early return or assertion
+unwind. If `cmd.exe` cannot be started, print an explicit skip message and
+return.
+
 For the last test, pass a directory as the log target so `OpenOptions::open` fails predictably. The test asserts an error result; it must not trigger a panic.
 
 Run:
@@ -425,14 +447,22 @@ Expected result: compilation fails because the recovery interfaces do not exist 
 
 - [ ] **Step 2: Implement marker inspection and creation**
 
-Implement `inspect` with `paths.marker_file.exists()`. Implement `create_marker` by creating the root directory and writing a new marker containing only diagnostic text:
+Implement `inspect` over the legacy `gui.running` file and unique sidecar markers. On Windows,
+inspect the marker PID with a non-blocking process wait; when a creation timestamp is present,
+compare it with the PID's current process creation timestamp to detect PID reuse. Remove only
+markers proven stale, preserve markers with unknown liveness, and keep legacy marker contents
+readable for compatibility. Implement `create_marker` by creating an owned sidecar containing
+diagnostic text:
 
 ```text
 pid=<std::process::id()>
 started_at=<seconds since UNIX_EPOCH>
 ```
 
-Use `std::fs::write` to replace an old marker after inspection. A marker creation error must return `RecoveryError` and prevent GUI startup. `RuntimeMarker::remove` uses `std::fs::remove_file`; a missing marker is treated as success so cleanup remains idempotent.
+Use exclusive creation for the sidecar so concurrent instances cannot overwrite each other's
+markers. A marker creation error must return `RecoveryError` and prevent GUI startup.
+`RuntimeMarker::remove` uses `std::fs::remove_file` for its owned sidecar; a missing marker is
+treated as success so cleanup remains idempotent.
 
 - [ ] **Step 3: Implement crash logging and panic-hook installation**
 
@@ -699,8 +729,6 @@ git commit -m "feat: wire RustNT GUI startup and recovery"
 **Files:**
 
 - Create `C:\Users\ceeses\Desktop\RustNT\.superpowers\sdd\task-14-report.md`
-- Modify `C:\Users\ceeses\Desktop\RustNT\docs\roadmap.md`
-- Modify `C:\Users\ceeses\Desktop\RustNT\.superpowers\sdd\progress.md`
 
 **Consumes:** The completed GUI crate and all prior commits.
 
@@ -737,7 +765,7 @@ Use a dedicated test profile or a temporary `%APPDATA%` root only when the envir
 
 Record the exact limitation if forced termination cannot be automated in the current desktop session; do not claim that scenario was verified without evidence.
 
-- [ ] **Step 3: Write the Task14 report and update roadmap/progress**
+- [ ] **Step 3: Write the Task14 report and verify protected project status files**
 
 Write `task-14-report.md` with:
 
@@ -748,7 +776,9 @@ Write `task-14-report.md` with:
 - any skipped smoke item with the reason;
 - explicit statement that the GUI remains a Windows user-mode client and does not alter kernel, driver, service, or Shell behavior.
 
-Update `docs/roadmap.md` only after the gate passes: mark Task14 as completed and identify Task15 desktop interaction components as the next task. Append one Task14 completion entry to `.superpowers/sdd/progress.md` with the actual final commit and verification summary.
+The final review record updates only `.superpowers/sdd/task-14-report.md`.
+README, roadmap, progress ledger, and the historical Task4 report are protected
+files for this closeout and must have no diff.
 
 - [ ] **Step 4: Run the final documentation and status checks**
 
@@ -759,13 +789,15 @@ git diff --check
 git status --short --branch
 ```
 
-Expected result: no whitespace errors, and only the intended report/roadmap/progress files are uncommitted before the final documentation commit. Review the plan and report text manually for unresolved placeholders before committing.
+Expected result: no whitespace errors, and only the recovery test, Task14
+spec/plan, and Task14 report are changed before the final commit. Review the
+plan and report text manually for unresolved placeholders before committing.
 
 - [ ] **Step 5: Commit the verified Task14 record**
 
 ```text
-git add .superpowers/sdd/task-14-report.md docs/roadmap.md .superpowers/sdd/progress.md
-git commit -m "docs: record Task14 GUI verification"
+git add crates/rustnt-gui/src/recovery.rs docs/superpowers/specs/2026-09-24-task-14-gui-foundation-design.md docs/superpowers/plans/2026-09-24-task-14-gui-foundation.md .superpowers/sdd/task-14-report.md
+git commit -m "test: close Task14 recovery liveness review"
 ```
 
 ## Self-Review Checklist
@@ -778,7 +810,7 @@ git commit -m "docs: record Task14 GUI verification"
 - Spec section 6 is covered by marker tests in Task 2 and ordered startup/cleanup in Task 4.
 - Spec section 7 is covered by first-screen controls and status messages in Task 3.
 - Spec section 8 is covered by focused tests, workspace commands, and the smoke matrix in Task 5.
-- Spec section 9 is covered by the final report, roadmap, progress ledger, and final status checks.
+- Spec section 9 is covered by the final report and final status checks.
 - Spec section 10 is covered by the README boundary statement and the absence of service/core changes in the File Map.
 - The plan contains no unresolved implementation placeholder.
 - The types used by `main.rs`, `app.rs`, `config.rs`, and `recovery.rs` match the Interfaces section.
