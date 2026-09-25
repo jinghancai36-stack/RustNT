@@ -665,8 +665,8 @@ mod tests {
 
         let root = TestRoot::new("live-child-marker");
         let paths = config_paths_from_root(root.path().to_owned());
-        let child = Command::new("cmd.exe")
-            .args(["/C", "timeout /T 5 /NOBREAK >NUL"])
+        let child = Command::new("ping.exe")
+            .args(["127.0.0.1", "-n", "6"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -675,17 +675,17 @@ mod tests {
             Ok(child) => child,
             Err(error) => {
                 eprintln!(
-                    "skipped: could not start cmd.exe for recovery integration test: {error}"
+                    "skipped: could not start ping.exe for recovery integration test: {error}"
                 );
                 return;
             }
         };
         let mut child = ChildGuard { child };
 
-        if child.try_wait().unwrap().is_some() {
-            eprintln!("skipped: cmd.exe exited before the marker could be inspected");
-            return;
-        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "ping.exe exited before the marker could be inspected"
+        );
 
         std::fs::create_dir_all(root.path()).unwrap();
         std::fs::write(

@@ -254,12 +254,14 @@ repair.
 ## Final Review Closeout: 2026-09-24
 
 Added a Windows-only real-process integration test in `recovery.rs`. It starts
-`cmd.exe /C timeout /T 5 /NOBREAK >NUL`, writes the child PID to a legacy-format
+`ping.exe 127.0.0.1 -n 6`, writes the child PID to a legacy-format
 marker, verifies `inspect` preserves the marker while the child is running, then
 waits for the child and verifies the next `inspect` removes the stale marker.
 The test uses an RAII child guard that kills and waits for the child during every
-early return or assertion unwind. If `cmd.exe` cannot be started, it prints an
-explicit skip message and returns without claiming coverage.
+early return or assertion unwind. If `ping.exe` cannot be started, it prints an
+explicit skip message and returns without claiming coverage. If the child exits
+before inspection, the test fails rather than silently skipping the running-
+process assertion.
 
 The Task14 spec and plan now make the implemented recovery contract explicit:
 Windows PID liveness, creation-time matching to prevent PID reuse, preservation

@@ -428,11 +428,11 @@ fn failed_crash_log_append_is_reported_without_panicking() {
 ```
 
 On Windows, add a real cross-process test that starts a short-lived
-`cmd.exe /C timeout ...` child, writes its PID to a marker, verifies the marker
+`ping.exe 127.0.0.1 -n 6` child, writes its PID to a marker, verifies the marker
 is retained while the child is running, then waits for the child and verifies
 the next inspection removes the stale marker. The test must own the child with
 an RAII cleanup guard that terminates and waits on early return or assertion
-unwind. If `cmd.exe` cannot be started, print an explicit skip message and
+unwind. If `ping.exe` cannot be started, print an explicit skip message and
 return.
 
 For the last test, pass a directory as the log target so `OpenOptions::open` fails predictably. The test asserts an error result; it must not trigger a panic.

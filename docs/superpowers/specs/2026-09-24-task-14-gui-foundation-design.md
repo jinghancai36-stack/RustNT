@@ -208,7 +208,7 @@ Shell 注册表或启动项。
 - 创建运行标记后能够读取诊断字段。
 - 正常清理会删除运行标记。
 - Windows 上真实启动非当前进程，验证其运行中 marker 保留、退出后 stale marker 清理；
-  无法启动 `cmd.exe` 时测试必须明确 skip/return。
+  测试使用不依赖 stdin 的 `ping.exe`，无法启动时必须明确 skip/return。
 - Windows 上覆盖 PID liveness、creation-time 不匹配清理、sidecar ownership 和多实例
   收敛；无法确认 liveness 时 marker 保留。
 - 崩溃日志写入失败不会让清理逻辑 panic。
