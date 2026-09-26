@@ -127,3 +127,11 @@ produce typed audit events. Rate-limited events omit the unvalidated requested P
 - Task 4: complete (commits 1117cf5..f50de9a, review clean). Wired APPDATA startup, stale-run recovery, eframe launch, normal-exit persistence, marker cleanup, GUI error handling, and README usage documentation.
 - Task 5: complete. Full workspace verification passed: 149 tests passed, workspace check/build/Clippy/format/diff checks all exited 0. Real isolated `cargo run -p rustnt-gui` startup created a responsive `RustNT` window and marker; dedicated forced-termination and relaunch recovery checks passed. Interactive theme/save/normal-close clicks were skipped because the current CUA session exposed no bindable native application; details are in `.superpowers/sdd/task-14-report.md`.
 - Task14 is complete at implementation commit `f50de9a`; the next capability is Task15 desktop interaction components.
+
+## Task 15 Desktop Interaction
+
+- Task 1: complete (commit b285855, review clean). Added fixed Overview/System Monitor/Windows & Sessions navigation metadata, local Ctrl+1/2/3 shortcut mapping, and deterministic navigation tests.
+- Task 2: complete (commit 8a1ca19, review clean). Added the bounded process-local notification center with FIFO eviction at 32 entries, newline cleanup, Unicode-safe truncation, read tracking, and clear behavior.
+- Task 3: complete (commits 711c700..cebf436, review clean). Added the single-window Shell, fixed internal page routing, explicit capability placeholders, local shortcut handling, and bounded notification UI with egui interaction tests.
+- Task 4: complete (verification clean). Confirmed Task15 scope boundaries, preserved Task14 behavior, and passed formatting, GUI tests, workspace check/build/Clippy, 184 workspace tests, and diff checks. Full details are in `.superpowers/sdd/task-15-report.md`.
+- Task15 is complete at implementation commit `cebf436` plus the Task4 verification documentation commit.

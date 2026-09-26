@@ -2,6 +2,8 @@
 
 pub mod app;
 pub mod config;
+pub mod navigation;
+pub mod notifications;
 pub mod recovery;
 
 use std::fmt;
