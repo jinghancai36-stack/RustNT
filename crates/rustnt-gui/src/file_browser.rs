@@ -375,7 +375,8 @@ fn is_drive_root(path: &str) -> bool {
 
 fn is_unc_share_root(path: &str) -> bool {
     let trimmed = path.trim_end_matches(['\\', '/']);
-    if !trimmed.starts_with(r"\\") {
+    let bytes = trimmed.as_bytes();
+    if bytes.len() < 2 || !matches!(bytes[0], b'\\' | b'/') || !matches!(bytes[1], b'\\' | b'/') {
         return false;
     }
     trimmed
@@ -554,6 +555,11 @@ mod tests {
         assert_eq!(
             FileBrowserState::parent_path(r"\\server\share\folder"),
             Some(r"\\server\share\".to_owned())
+        );
+        assert_eq!(FileBrowserState::parent_path("//server/share/"), None);
+        assert_eq!(
+            FileBrowserState::parent_path("//server/share/folder"),
+            Some("//server/share/".to_owned())
         );
     }
 
