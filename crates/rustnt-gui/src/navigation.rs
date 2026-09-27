@@ -2,7 +2,7 @@
 pub enum PageId {
     Overview,
     SystemMonitor,
-    WindowsSessions,
+    FileManager,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -21,18 +21,14 @@ impl Default for NavigationState {
 }
 
 pub fn pages() -> &'static [PageId] {
-    &[
-        PageId::Overview,
-        PageId::SystemMonitor,
-        PageId::WindowsSessions,
-    ]
+    &[PageId::Overview, PageId::SystemMonitor, PageId::FileManager]
 }
 
 pub fn page_title(page: PageId) -> &'static str {
     match page {
         PageId::Overview => "Overview",
         PageId::SystemMonitor => "System Monitor",
-        PageId::WindowsSessions => "Windows Sessions",
+        PageId::FileManager => "File Manager",
     }
 }
 
@@ -40,7 +36,7 @@ pub fn page_label(page: PageId) -> &'static str {
     match page {
         PageId::Overview => "Overview",
         PageId::SystemMonitor => "System",
-        PageId::WindowsSessions => "Sessions",
+        PageId::FileManager => "File Manager",
     }
 }
 
@@ -52,7 +48,7 @@ pub fn page_for_shortcut(ctrl: bool, key: eframe::egui::Key) -> Option<PageId> {
     match key {
         eframe::egui::Key::Num1 => Some(PageId::Overview),
         eframe::egui::Key::Num2 => Some(PageId::SystemMonitor),
-        eframe::egui::Key::Num3 => Some(PageId::WindowsSessions),
+        eframe::egui::Key::Num3 => Some(PageId::FileManager),
         _ => None,
     }
 }
@@ -66,11 +62,7 @@ mod tests {
     fn pages_have_fixed_order() {
         assert_eq!(
             pages(),
-            &[
-                PageId::Overview,
-                PageId::SystemMonitor,
-                PageId::WindowsSessions
-            ]
+            &[PageId::Overview, PageId::SystemMonitor, PageId::FileManager]
         );
     }
 
@@ -80,8 +72,8 @@ mod tests {
         assert_eq!(page_title(PageId::Overview), "Overview");
         assert_eq!(page_label(PageId::SystemMonitor), "System");
         assert_eq!(page_title(PageId::SystemMonitor), "System Monitor");
-        assert_eq!(page_label(PageId::WindowsSessions), "Sessions");
-        assert_eq!(page_title(PageId::WindowsSessions), "Windows Sessions");
+        assert_eq!(page_label(PageId::FileManager), "File Manager");
+        assert_eq!(page_title(PageId::FileManager), "File Manager");
     }
 
     #[test]
@@ -93,7 +85,7 @@ mod tests {
         );
         assert_eq!(
             page_for_shortcut(true, Key::Num3),
-            Some(PageId::WindowsSessions)
+            Some(PageId::FileManager)
         );
     }
 
