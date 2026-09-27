@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 eframe.workspace = true
+rustnt-core = { path = "../rustnt-core" }
 serde.workspace = true
 toml.workspace = true
 windows-sys.workspace = true
