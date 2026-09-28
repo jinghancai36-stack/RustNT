@@ -135,3 +135,10 @@ produce typed audit events. Rate-limited events omit the unvalidated requested P
 - Task 3: complete (commits 711c700..cebf436, review clean). Added the single-window Shell, fixed internal page routing, explicit capability placeholders, local shortcut handling, and bounded notification UI with egui interaction tests.
 - Task 4: complete (verification clean). Confirmed Task15 scope boundaries, preserved Task14 behavior, and passed formatting, GUI tests, workspace check/build/Clippy, 184 workspace tests, and diff checks. Full details are in `.superpowers/sdd/task-15-report.md`.
 - Task15 is complete at implementation commit `cebf436` plus the Task4 verification documentation commit.
+
+## Task 16 File Manager v1
+
+- Task 1: complete (commits 095da7c..57ce351, review clean). Added the read-only browser state, injected directory loading, path history, drive/UNC root boundaries, deterministic filtering/sorting, error retention, and reparse-point metadata handling using the existing core filesystem API.
+- Task 2: complete (commit 628f423, review clean). Routed the third GUI page to File Manager and integrated read-only path navigation, direct-child metadata display, filtering, sorting, refresh/history controls, error retention, and one-notification-per-failed-action behavior. Workspace Clippy test lints were corrected in `9906070`.
+- Task 3: complete (verification clean). Confirmed the read-only scope, preserved Task14/Task15 behavior, passed formatting, GUI tests, workspace check/build/Clippy, 204 serial workspace tests, and diff checks. Full details are in `.superpowers/sdd/task-16-report.md`.
+- Task16 is complete at implementation commit `628f423` plus fixes `57ce351`, `9906070`, and the Task3 verification documentation commit.
