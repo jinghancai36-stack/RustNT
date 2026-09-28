@@ -44,14 +44,8 @@ impl RustNtApp {
             notifications.push(NotificationKind::Warning, RECOVERY_NOTICE);
         }
 
-        let mut file_browser = FileBrowserState::new(initial_file_browser_path());
-        let initial_path = file_browser.current_path().to_owned();
-        if file_browser.load().is_err() {
-            if let Some(fallback) = process_directory_path().filter(|path| path != &initial_path) {
-                file_browser = FileBrowserState::new(fallback);
-                let _ = file_browser.load();
-            }
-        }
+        let file_browser =
+            initialize_file_browser(initial_file_browser_path(), process_directory_path());
         let file_browser_path_input = file_browser.current_path().to_owned();
 
         Self {
@@ -580,6 +574,39 @@ fn initial_file_browser_path() -> String {
         .unwrap_or_else(|| FileBrowserState::default().current_path().to_owned())
 }
 
+fn initialize_file_browser(
+    preferred_path: String,
+    fallback_path: Option<String>,
+) -> FileBrowserState {
+    initialize_file_browser_with(preferred_path, fallback_path, list_directory)
+}
+
+fn initialize_file_browser_with<F>(
+    preferred_path: String,
+    fallback_path: Option<String>,
+    mut loader: F,
+) -> FileBrowserState
+where
+    F: FnMut(&str) -> Result<Vec<DirectoryEntry>, FileSystemError>,
+{
+    let mut file_browser = FileBrowserState::new(preferred_path);
+    let preferred_error = match file_browser.load_with(&mut loader) {
+        Ok(()) => return file_browser,
+        Err(error) => error,
+    };
+
+    let Some(fallback_path) = fallback_path.filter(|path| path != file_browser.current_path())
+    else {
+        return file_browser;
+    };
+
+    let mut fallback_browser = FileBrowserState::new(fallback_path);
+    if fallback_browser.load_with(&mut loader).is_ok() {
+        let _ = fallback_browser.load_with(|_| Err(preferred_error.clone()));
+    }
+    fallback_browser
+}
+
 fn process_directory_path() -> Option<String> {
     std::env::current_dir()
         .ok()
@@ -710,8 +737,8 @@ mod tests {
     use crate::recovery::RecoveryState;
 
     use super::{
-        placeholder_text, recovery_label, theme_label, viewport_settings_for, RustNtApp,
-        ViewportSettings,
+        initialize_file_browser_with, placeholder_text, recovery_label, theme_label,
+        viewport_settings_for, RustNtApp, ViewportSettings,
     };
 
     fn fixture_entries(path: &str) -> Vec<DirectoryEntry> {
@@ -818,6 +845,30 @@ mod tests {
 
         assert!(app.file_browser.view().loaded);
         assert!(!app.file_browser.current_path().is_empty());
+    }
+
+    #[test]
+    fn initial_file_browser_fallback_retains_preferred_directory_error() {
+        let preferred_path = r"C:\preferred".to_owned();
+        let fallback_path = r"C:\fallback".to_owned();
+        let preferred_error = FileSystemError::NotFound(preferred_path.clone());
+
+        let state = initialize_file_browser_with(
+            preferred_path.clone(),
+            Some(fallback_path.clone()),
+            |path| {
+                if path == preferred_path {
+                    Err(preferred_error.clone())
+                } else {
+                    Ok(fixture_entries(path))
+                }
+            },
+        );
+
+        assert_eq!(state.current_path(), fallback_path);
+        assert_eq!(state.entries(), fixture_entries(r"C:\fallback").as_slice());
+        assert_eq!(state.last_error(), Some(&preferred_error));
+        assert_eq!(state.view().last_error, Some(preferred_error));
     }
 
     #[test]
