@@ -140,5 +140,5 @@ produce typed audit events. Rate-limited events omit the unvalidated requested P
 
 - Task 1: complete (commits 095da7c..57ce351, review clean). Added the read-only browser state, injected directory loading, path history, drive/UNC root boundaries, deterministic filtering/sorting, error retention, and reparse-point metadata handling using the existing core filesystem API.
 - Task 2: complete (commit 628f423, review clean). Routed the third GUI page to File Manager and integrated read-only path navigation, direct-child metadata display, filtering, sorting, refresh/history controls, error retention, and one-notification-per-failed-action behavior. Workspace Clippy test lints were corrected in `9906070`.
-- Task 3: complete (verification clean). Confirmed the read-only scope, preserved Task14/Task15 behavior, passed formatting, GUI tests, workspace check/build/Clippy, 204 serial workspace tests, and diff checks. Full details are in `.superpowers/sdd/task-16-report.md`.
-- Task16 is complete at implementation commit `628f423` plus fixes `57ce351`, `9906070`, and the Task3 verification documentation commit.
+- Task 3: complete (verification clean). Confirmed the read-only scope, preserved Task14/Task15 behavior, passed formatting, GUI tests, workspace check/build/Clippy, 205 serial workspace tests, and diff checks. Full details are in `.superpowers/sdd/task-16-report.md`.
+- Task16 is complete at implementation commit `628f423` plus fixes `57ce351`, `9906070`, `97af6ae`, and the Task3 verification documentation commit.
