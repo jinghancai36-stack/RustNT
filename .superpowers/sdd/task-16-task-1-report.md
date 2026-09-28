@@ -59,3 +59,9 @@ Verification:
 The new forward-slash assertions first failed with the previous implementation
 because `//server/share/` incorrectly returned `Some("//server/")`; they pass
 after the prefix check was corrected.
+
+## Clippy Warning Fix
+
+The Task1 test assertions were updated to satisfy workspace Clippy without
+changing production behavior: `std::slice::from_ref(&child)` replaces the
+cloned single-element slice, and `!is_empty()` replaces the boolean comparison.

@@ -579,12 +579,12 @@ mod tests {
             .expect("back should load");
         assert_eq!(state.current_path(), root);
         assert!(state.back_stack().is_empty());
-        assert_eq!(state.forward_stack(), &[child.clone()]);
+        assert_eq!(state.forward_stack(), std::slice::from_ref(&child));
         state
             .forward(loader_for(directories))
             .expect("forward should load");
         assert_eq!(state.current_path(), child);
-        assert!(state.back_stack().is_empty() == false);
+        assert!(!state.back_stack().is_empty());
         assert!(state.forward_stack().is_empty());
     }
 
