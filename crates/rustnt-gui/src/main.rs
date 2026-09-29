@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod config;
+pub mod file_browser;
 pub mod navigation;
 pub mod notifications;
 pub mod recovery;

@@ -2636,6 +2636,7 @@ name = "rustnt-gui"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "rustnt-core",
  "serde",
  "toml",
  "windows-sys 0.59.0",

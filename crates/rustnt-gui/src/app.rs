@@ -1,8 +1,10 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use eframe::egui;
+use rustnt_core::filesystem::{list_directory, DirectoryEntry, FileKind, FileSystemError};
 
 use crate::config::{save_config, ConfigError, ConfigPaths, GuiConfig, ThemeMode};
+use crate::file_browser::{FileBrowserState, SortDirection, SortField};
 use crate::navigation::{
     page_for_shortcut, page_label, page_title, pages, NavigationState, PageId,
 };
@@ -22,7 +24,9 @@ pub struct RustNtApp {
     pub(crate) save_notice: Option<String>,
     pub(crate) navigation: NavigationState,
     pub(crate) notifications: NotificationCenter,
+    pub(crate) file_browser: FileBrowserState,
     notifications_open: bool,
+    file_browser_path_input: String,
 }
 
 impl RustNtApp {
@@ -40,6 +44,10 @@ impl RustNtApp {
             notifications.push(NotificationKind::Warning, RECOVERY_NOTICE);
         }
 
+        let file_browser =
+            initialize_file_browser(initial_file_browser_path(), process_directory_path());
+        let file_browser_path_input = file_browser.current_path().to_owned();
+
         Self {
             config,
             paths,
@@ -48,7 +56,9 @@ impl RustNtApp {
             save_notice: None,
             navigation: NavigationState::default(),
             notifications,
+            file_browser,
             notifications_open: false,
+            file_browser_path_input,
         }
     }
 
@@ -119,6 +129,95 @@ impl RustNtApp {
                 self.notifications.push(NotificationKind::Error, notice);
             }
         }
+    }
+
+    fn finish_file_browser_action<T>(
+        &mut self,
+        result: Result<T, FileSystemError>,
+    ) -> Result<T, FileSystemError> {
+        match result {
+            Ok(value) => {
+                self.file_browser_path_input = self.file_browser.current_path().to_owned();
+                Ok(value)
+            }
+            Err(error) => {
+                self.file_browser_path_input = self.file_browser.current_path().to_owned();
+                self.notifications.push(
+                    NotificationKind::Error,
+                    format!("File Manager: {}", file_system_error_label(&error)),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn load_file_browser(&mut self) -> Result<(), FileSystemError> {
+        let result = self.file_browser.load();
+        self.finish_file_browser_action(result)
+    }
+
+    #[cfg(test)]
+    fn load_file_browser_with<F>(&mut self, loader: F) -> Result<(), FileSystemError>
+    where
+        F: FnOnce(&str) -> Result<Vec<DirectoryEntry>, FileSystemError>,
+    {
+        let result = self.file_browser.load_with(loader);
+        self.finish_file_browser_action(result)
+    }
+
+    fn navigate_file_browser(&mut self, path: String) -> Result<(), FileSystemError> {
+        self.navigate_file_browser_with(path, list_directory)
+    }
+
+    fn navigate_file_browser_with<F>(
+        &mut self,
+        path: impl Into<String>,
+        loader: F,
+    ) -> Result<(), FileSystemError>
+    where
+        F: FnOnce(&str) -> Result<Vec<DirectoryEntry>, FileSystemError>,
+    {
+        let result = self.file_browser.navigate_to(path, loader);
+        self.finish_file_browser_action(result)
+    }
+
+    fn go_back_file_browser(&mut self) -> Result<bool, FileSystemError> {
+        self.go_back_file_browser_with(list_directory)
+    }
+
+    fn go_back_file_browser_with<F>(&mut self, loader: F) -> Result<bool, FileSystemError>
+    where
+        F: FnOnce(&str) -> Result<Vec<DirectoryEntry>, FileSystemError>,
+    {
+        let result = self.file_browser.back(loader);
+        self.finish_file_browser_action(result)
+    }
+
+    fn go_forward_file_browser(&mut self) -> Result<bool, FileSystemError> {
+        self.go_forward_file_browser_with(list_directory)
+    }
+
+    fn go_forward_file_browser_with<F>(&mut self, loader: F) -> Result<bool, FileSystemError>
+    where
+        F: FnOnce(&str) -> Result<Vec<DirectoryEntry>, FileSystemError>,
+    {
+        let result = self.file_browser.forward(loader);
+        self.finish_file_browser_action(result)
+    }
+
+    fn go_parent_file_browser(&mut self) -> Result<bool, FileSystemError> {
+        let result = self.file_browser.parent(list_directory);
+        self.finish_file_browser_action(result)
+    }
+
+    fn set_file_browser_filter(&mut self, filter: impl Into<String>) {
+        self.file_browser.set_filter(filter);
+    }
+
+    #[cfg(test)]
+    fn set_file_browser_sort(&mut self, field: SortField, direction: SortDirection) {
+        self.file_browser.set_sort_field(field);
+        self.file_browser.set_sort_direction(direction);
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
@@ -200,10 +299,135 @@ impl RustNtApp {
     fn show_central_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, theme: ThemeMode) {
         egui::CentralPanel::default().show(ui, |ui| match self.navigation.current_page {
             PageId::Overview => self.show_overview(ui, ctx, theme),
-            PageId::SystemMonitor | PageId::WindowsSessions => {
+            PageId::SystemMonitor => {
                 ui.heading(page_title(self.navigation.current_page));
                 ui.label(placeholder_text(self.navigation.current_page));
             }
+            PageId::FileManager => self.show_file_manager(ui),
+        });
+    }
+
+    fn show_file_manager(&mut self, ui: &mut egui::Ui) {
+        ui.heading("File Manager");
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !self.file_browser.back_stack().is_empty(),
+                    egui::Button::new("Back"),
+                )
+                .clicked()
+            {
+                let _ = self.go_back_file_browser();
+            }
+            if ui
+                .add_enabled(
+                    !self.file_browser.forward_stack().is_empty(),
+                    egui::Button::new("Forward"),
+                )
+                .clicked()
+            {
+                let _ = self.go_forward_file_browser();
+            }
+            if ui
+                .add_enabled(
+                    FileBrowserState::parent_path(self.file_browser.current_path()).is_some(),
+                    egui::Button::new("Parent"),
+                )
+                .clicked()
+            {
+                let _ = self.go_parent_file_browser();
+            }
+            if ui.button("Refresh").clicked() {
+                let _ = self.load_file_browser();
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Path");
+            let response = ui.text_edit_singleline(&mut self.file_browser_path_input);
+            if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                let path = self.file_browser_path_input.clone();
+                let _ = self.navigate_file_browser(path);
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Filter");
+            let mut filter = self.file_browser.filter().to_owned();
+            if ui.text_edit_singleline(&mut filter).changed() {
+                self.set_file_browser_filter(filter);
+            }
+            let mut sort_field = self.file_browser.sort_field();
+            egui::ComboBox::from_id_salt("file-manager-sort-field")
+                .selected_text(sort_field_label(sort_field))
+                .show_ui(ui, |ui| {
+                    for field in [
+                        SortField::Name,
+                        SortField::Kind,
+                        SortField::Size,
+                        SortField::Modified,
+                    ] {
+                        if ui
+                            .selectable_value(&mut sort_field, field, sort_field_label(field))
+                            .clicked()
+                        {
+                            self.file_browser.set_sort_field(sort_field);
+                        }
+                    }
+                });
+            if ui
+                .button(sort_direction_label(self.file_browser.sort_direction()))
+                .clicked()
+            {
+                let direction = match self.file_browser.sort_direction() {
+                    SortDirection::Ascending => SortDirection::Descending,
+                    SortDirection::Descending => SortDirection::Ascending,
+                };
+                self.file_browser.set_sort_direction(direction);
+            }
+        });
+
+        let view = self.file_browser.view();
+        ui.label(format!("Path: {}", view.path));
+        if let Some(error) = &view.last_error {
+            ui.colored_label(
+                egui::Color32::RED,
+                format!("Error: {}", file_system_error_label(error)),
+            );
+        } else if view.is_empty && view.loaded {
+            ui.label("Directory is empty");
+        } else {
+            ui.label(format!("{} direct item(s)", view.entries.len()));
+        }
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::Grid::new("file-manager-table")
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.strong("Name");
+                    ui.strong("Type");
+                    ui.strong("Size");
+                    ui.strong("Modified");
+                    ui.end_row();
+                    for entry in view.entries {
+                        let name = crate::file_browser::entry_name(&entry.metadata.path);
+                        let response = ui.selectable_label(
+                            view.selected_path.as_deref() == Some(entry.metadata.path.as_str()),
+                            name,
+                        );
+                        if response.clicked() && entry.metadata.kind == FileKind::Directory {
+                            self.file_browser
+                                .set_selected_path(Some(entry.metadata.path.clone()));
+                        }
+                        if response.double_clicked() && entry.metadata.kind == FileKind::Directory {
+                            let _ = self.navigate_file_browser(entry.metadata.path.clone());
+                        }
+                        ui.label(file_kind_label(&entry));
+                        ui.label(file_size_label(&entry));
+                        ui.label(file_modified_label(&entry));
+                        ui.end_row();
+                    }
+                });
         });
     }
 
@@ -253,7 +477,7 @@ impl RustNtApp {
                     let shortcut = match *page {
                         PageId::Overview => "1",
                         PageId::SystemMonitor => "2",
-                        PageId::WindowsSessions => "3",
+                        PageId::FileManager => "3",
                     };
                     if ui
                         .selectable_label(
@@ -337,8 +561,112 @@ fn notification_kind_label(kind: NotificationKind) -> &'static str {
 pub(crate) fn placeholder_text(page: PageId) -> &'static str {
     match page {
         PageId::Overview => "",
-        PageId::SystemMonitor | PageId::WindowsSessions => UNCONNECTED_DATA_SOURCE,
+        PageId::SystemMonitor => UNCONNECTED_DATA_SOURCE,
+        PageId::FileManager => "",
     }
+}
+
+fn initial_file_browser_path() -> String {
+    std::env::var("USERPROFILE")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .or_else(process_directory_path)
+        .unwrap_or_else(|| FileBrowserState::default().current_path().to_owned())
+}
+
+fn initialize_file_browser(
+    preferred_path: String,
+    fallback_path: Option<String>,
+) -> FileBrowserState {
+    initialize_file_browser_with(preferred_path, fallback_path, list_directory)
+}
+
+fn initialize_file_browser_with<F>(
+    preferred_path: String,
+    fallback_path: Option<String>,
+    mut loader: F,
+) -> FileBrowserState
+where
+    F: FnMut(&str) -> Result<Vec<DirectoryEntry>, FileSystemError>,
+{
+    let mut file_browser = FileBrowserState::new(preferred_path);
+    let preferred_error = match file_browser.load_with(&mut loader) {
+        Ok(()) => return file_browser,
+        Err(error) => error,
+    };
+
+    let Some(fallback_path) = fallback_path.filter(|path| path != file_browser.current_path())
+    else {
+        return file_browser;
+    };
+
+    let mut fallback_browser = FileBrowserState::new(fallback_path);
+    if fallback_browser.load_with(&mut loader).is_ok() {
+        let _ = fallback_browser.load_with(|_| Err(preferred_error.clone()));
+    }
+    fallback_browser
+}
+
+fn process_directory_path() -> Option<String> {
+    std::env::current_dir()
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+fn file_system_error_label(error: &FileSystemError) -> String {
+    match error {
+        FileSystemError::InvalidPath(path) => format!("Invalid path: {path}"),
+        FileSystemError::NotFound(path) => format!("Path not found: {path}"),
+        FileSystemError::AccessDenied(path) => format!("Access denied: {path}"),
+        FileSystemError::Io(message) => format!("I/O error: {message}"),
+        FileSystemError::Win32 { operation, code } => {
+            format!("{operation} failed (Windows error {code})")
+        }
+    }
+}
+
+fn sort_field_label(field: SortField) -> &'static str {
+    match field {
+        SortField::Name => "Name",
+        SortField::Kind => "Type",
+        SortField::Size => "Size",
+        SortField::Modified => "Modified",
+    }
+}
+
+fn sort_direction_label(direction: SortDirection) -> &'static str {
+    match direction {
+        SortDirection::Ascending => "Ascending",
+        SortDirection::Descending => "Descending",
+    }
+}
+
+fn file_kind_label(entry: &DirectoryEntry) -> &'static str {
+    if entry.metadata.is_reparse_point {
+        return "Reparse point";
+    }
+    match entry.metadata.kind {
+        FileKind::Directory => "Directory",
+        FileKind::File => "File",
+        FileKind::ReparsePoint => "Reparse point",
+        FileKind::Other => "Other",
+    }
+}
+
+fn file_size_label(entry: &DirectoryEntry) -> String {
+    entry
+        .metadata
+        .size_bytes
+        .map(|size| size.to_string())
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn file_modified_label(entry: &DirectoryEntry) -> String {
+    entry
+        .metadata
+        .modified
+        .map(|modified| format!("{modified:?}"))
+        .unwrap_or_else(|| "-".to_owned())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -398,17 +726,49 @@ pub fn recovery_label(recovery: RecoveryState) -> &'static str {
 mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, UNIX_EPOCH};
 
+    use crate::file_browser::{SortDirection, SortField};
     use eframe::egui;
+    use rustnt_core::filesystem::{DirectoryEntry, FileKind, FileMetadata, FileSystemError};
 
     use crate::config::{config_paths_from_root, GuiConfig, ThemeMode};
     use crate::navigation::PageId;
     use crate::recovery::RecoveryState;
 
     use super::{
-        placeholder_text, recovery_label, theme_label, viewport_settings_for, RustNtApp,
-        ViewportSettings,
+        initialize_file_browser_with, placeholder_text, recovery_label, theme_label,
+        viewport_settings_for, RustNtApp, ViewportSettings,
     };
+
+    fn fixture_entries(path: &str) -> Vec<DirectoryEntry> {
+        vec![
+            DirectoryEntry {
+                metadata: FileMetadata {
+                    path: format!(r"{path}\alpha"),
+                    kind: FileKind::Directory,
+                    size_bytes: None,
+                    created: None,
+                    modified: Some(UNIX_EPOCH + Duration::from_secs(2)),
+                    accessed: None,
+                    attributes: 0,
+                    is_reparse_point: false,
+                },
+            },
+            DirectoryEntry {
+                metadata: FileMetadata {
+                    path: format!(r"{path}\beta.txt"),
+                    kind: FileKind::File,
+                    size_bytes: Some(20),
+                    created: None,
+                    modified: Some(UNIX_EPOCH + Duration::from_secs(1)),
+                    accessed: None,
+                    attributes: 0,
+                    is_reparse_point: false,
+                },
+            },
+        ]
+    }
 
     fn test_app(config_notice: Option<String>) -> RustNtApp {
         RustNtApp::new(
@@ -477,6 +837,117 @@ mod tests {
         assert_eq!(app.navigation.current_page, PageId::Overview);
         assert!(!app.navigation.switcher_open);
         assert!(app.notifications.notifications().is_empty());
+    }
+
+    #[test]
+    fn new_app_initializes_a_loaded_file_manager_directory() {
+        let app = test_app(None);
+
+        assert!(app.file_browser.view().loaded);
+        assert!(!app.file_browser.current_path().is_empty());
+    }
+
+    #[test]
+    fn initial_file_browser_fallback_retains_preferred_directory_error() {
+        let preferred_path = r"C:\preferred".to_owned();
+        let fallback_path = r"C:\fallback".to_owned();
+        let preferred_error = FileSystemError::NotFound(preferred_path.clone());
+
+        let state = initialize_file_browser_with(
+            preferred_path.clone(),
+            Some(fallback_path.clone()),
+            |path| {
+                if path == preferred_path {
+                    Err(preferred_error.clone())
+                } else {
+                    Ok(fixture_entries(path))
+                }
+            },
+        );
+
+        assert_eq!(state.current_path(), fallback_path);
+        assert_eq!(state.entries(), fixture_entries(r"C:\fallback").as_slice());
+        assert_eq!(state.last_error(), Some(&preferred_error));
+        assert_eq!(state.view().last_error, Some(preferred_error));
+    }
+
+    #[test]
+    fn injected_directory_entries_are_presented_by_the_file_manager() {
+        let mut app = test_app(None);
+
+        app.load_file_browser_with(|path| Ok(fixture_entries(path)))
+            .expect("injected directory should load");
+
+        let view = app.file_browser.view();
+        assert_eq!(view.entries.len(), 2);
+        assert_eq!(view.entries[0].metadata.kind, FileKind::Directory);
+        assert_eq!(view.entries[1].metadata.kind, FileKind::File);
+    }
+
+    #[test]
+    fn file_manager_path_controls_preserve_history() {
+        let mut app = test_app(None);
+        app.load_file_browser_with(|path| Ok(fixture_entries(path)))
+            .unwrap();
+        let root = app.file_browser.current_path().to_owned();
+
+        app.navigate_file_browser_with("child", |path| Ok(fixture_entries(path)))
+            .unwrap();
+        assert_eq!(app.file_browser.current_path(), "child");
+        assert_eq!(app.file_browser.back_stack(), std::slice::from_ref(&root));
+
+        app.go_back_file_browser_with(|path| Ok(fixture_entries(path)))
+            .unwrap();
+        assert_eq!(app.file_browser.current_path(), root);
+        app.go_forward_file_browser_with(|path| Ok(fixture_entries(path)))
+            .unwrap();
+        assert_eq!(app.file_browser.current_path(), "child");
+    }
+
+    #[test]
+    fn file_manager_filter_and_sort_controls_update_the_view() {
+        let mut app = test_app(None);
+        app.load_file_browser_with(|path| Ok(fixture_entries(path)))
+            .unwrap();
+
+        app.set_file_browser_filter("beta");
+        app.set_file_browser_sort(SortField::Size, SortDirection::Descending);
+
+        let view = app.file_browser.view();
+        assert_eq!(view.entries.len(), 1);
+        assert!(view.entries[0].metadata.path.ends_with(r"\beta.txt"));
+    }
+
+    #[test]
+    fn empty_file_manager_directory_has_stable_empty_copy() {
+        let mut app = test_app(None);
+
+        app.load_file_browser_with(|_| Ok(Vec::new()))
+            .expect("empty directory should load");
+
+        let view = app.file_browser.view();
+        assert!(view.loaded);
+        assert!(view.is_empty);
+        assert!(view.entries.is_empty());
+    }
+
+    #[test]
+    fn failed_file_manager_action_keeps_contents_and_adds_one_error() {
+        let mut app = test_app(None);
+        app.load_file_browser_with(|path| Ok(fixture_entries(path)))
+            .unwrap();
+        let path = app.file_browser.current_path().to_owned();
+        let entries = app.file_browser.entries().to_vec();
+
+        let error = app.navigate_file_browser_with("missing", |_| {
+            Err(FileSystemError::NotFound("missing".to_owned()))
+        });
+
+        assert!(error.is_err());
+        assert_eq!(app.file_browser.current_path(), path);
+        assert_eq!(app.file_browser.entries(), entries.as_slice());
+        assert!(app.file_browser.view().last_error.is_some());
+        assert_eq!(app.notifications.notifications().len(), 1);
     }
 
     #[test]
@@ -602,7 +1073,7 @@ mod tests {
         let expected = "Data source is not connected yet.";
 
         assert_eq!(placeholder_text(PageId::SystemMonitor), expected);
-        assert_eq!(placeholder_text(PageId::WindowsSessions), expected);
+        assert_eq!(placeholder_text(PageId::FileManager), "");
     }
 
     #[test]
