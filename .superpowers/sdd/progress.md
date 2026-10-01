@@ -152,3 +152,7 @@ produce typed audit events. Rate-limited events omit the unvalidated requested P
   injected, platform-neutral Shell snapshot model with deterministic Winlogon
   targets, bounded metadata, digesting, control sanitization, embedded-NUL and
   oversized-input rejection, plus metadata-only TOML serialization coverage.
+- Task 3: complete (commits `796e211..1d74606`, review clean). Added the
+  Windows-only HKLM Winlogon reader using `KEY_QUERY_VALUE`, bounded registry
+  reads, typed errors, UTF-16 decoding, and RAII key closure. A formatting-only
+  follow-up is recorded in `ac85f30`.
