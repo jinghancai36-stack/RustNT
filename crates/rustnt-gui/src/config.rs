@@ -113,6 +113,9 @@ pub struct ConfigPaths {
     pub config_file: PathBuf,
     pub marker_file: PathBuf,
     pub crash_log: PathBuf,
+    pub shell_snapshot_file: PathBuf,
+    pub shell_recovery_log: PathBuf,
+    pub shell_session_file: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,6 +200,9 @@ pub fn config_paths_from_root(root: PathBuf) -> ConfigPaths {
         config_file: root.join("gui.toml"),
         marker_file: root.join("gui.running"),
         crash_log: root.join("gui-crash.log"),
+        shell_snapshot_file: root.join("shell_snapshot.toml"),
+        shell_recovery_log: root.join("shell_recovery.log"),
+        shell_session_file: root.join("shell.session"),
         root,
     }
 }
@@ -551,5 +557,18 @@ mod tests {
         assert_eq!(paths.marker_file, paths.root.join("gui.running"));
         assert_eq!(paths.crash_log, paths.root.join("gui-crash.log"));
         assert!(!paths.root.exists());
+    }
+
+    #[test]
+    fn root_constructor_adds_task17a_paths_without_changing_existing_paths() {
+        let root = TestRoot::new("task17a-paths");
+        let paths = config_paths_from_root(root.path().to_owned());
+        assert_eq!(paths.config_file, root.path().join("gui.toml"));
+        assert_eq!(paths.marker_file, root.path().join("gui.running"));
+        assert_eq!(paths.crash_log, root.path().join("gui-crash.log"));
+        assert_eq!(paths.shell_snapshot_file, root.path().join("shell_snapshot.toml"));
+        assert_eq!(paths.shell_recovery_log, root.path().join("shell_recovery.log"));
+        assert_eq!(paths.shell_session_file, root.path().join("shell.session"));
+        assert!(!root.path().exists());
     }
 }
