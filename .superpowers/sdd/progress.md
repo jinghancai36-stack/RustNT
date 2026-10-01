@@ -156,3 +156,7 @@ produce typed audit events. Rate-limited events omit the unvalidated requested P
   Windows-only HKLM Winlogon reader using `KEY_QUERY_VALUE`, bounded registry
   reads, typed errors, UTF-16 decoding, and RAII key closure. A formatting-only
   follow-up is recorded in `ac85f30`.
+- Task 4: complete (commits `a055674..7edaa89`, review clean). Added versioned
+  metadata-only TOML snapshot persistence with unique temporary files, atomic
+  replacement, unknown/corrupt-file preservation, failure cleanup, and direct
+  replacement-failure coverage.
