@@ -6,6 +6,7 @@ pub mod file_browser;
 pub mod navigation;
 pub mod notifications;
 pub mod recovery;
+pub mod shell_recovery;
 pub mod shell_snapshot;
 
 use std::fmt;
