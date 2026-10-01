@@ -44,6 +44,213 @@ pub trait ShellValueReader {
     fn read(&self, target: ShellValueTarget) -> Result<RegistryRead, RegistryReadError>;
 }
 
+#[cfg(windows)]
+pub struct WindowsShellReader;
+
+#[cfg(windows)]
+impl WindowsShellReader {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(windows)]
+impl Default for WindowsShellReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(windows)]
+impl ShellValueReader for WindowsShellReader {
+    fn read(&self, target: ShellValueTarget) -> Result<RegistryRead, RegistryReadError> {
+        use std::ptr::{null, null_mut};
+        use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA};
+        use windows_sys::Win32::System::Registry::{
+            RegOpenKeyExW, RegQueryValueExW, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, REG_EXPAND_SZ,
+            REG_SZ,
+        };
+
+        const KEY_PATH: &str = r"Software\Microsoft\Windows NT\CurrentVersion\Winlogon";
+        const SHELL_NAME: &str = "Shell";
+        const USERINIT_NAME: &str = "Userinit";
+
+        let value_name = match target {
+            ShellValueTarget::Shell => SHELL_NAME,
+            ShellValueTarget::Userinit => USERINIT_NAME,
+        };
+        let key_path = wide_null(KEY_PATH);
+        let value_name = wide_null(value_name);
+        let mut key = null_mut();
+        let status = unsafe {
+            RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                key_path.as_ptr(),
+                0,
+                KEY_QUERY_VALUE,
+                &mut key,
+            )
+        };
+        if status != 0 {
+            return if status == ERROR_FILE_NOT_FOUND {
+                Ok(RegistryRead::Missing)
+            } else {
+                Err(registry_error(status))
+            };
+        }
+        let _key_guard = RegistryKey(key);
+
+        let mut raw_value_type = 0_u32;
+        let mut byte_count = 0_u32;
+        let status = unsafe {
+            RegQueryValueExW(
+                key,
+                value_name.as_ptr(),
+                null(),
+                &mut raw_value_type,
+                null_mut(),
+                &mut byte_count,
+            )
+        };
+        if status != 0 {
+            return if status == ERROR_FILE_NOT_FOUND {
+                Ok(RegistryRead::Missing)
+            } else {
+                Err(registry_error(status))
+            };
+        }
+
+        let value_type = match raw_value_type {
+            REG_SZ => RegistryValueType::String,
+            REG_EXPAND_SZ => RegistryValueType::ExpandString,
+            _ => {
+                return Err(RegistryReadError {
+                    category: "unsupported_type".to_owned(),
+                    win32_code: None,
+                });
+            }
+        };
+        let byte_count = byte_count as usize;
+        if byte_count > MAX_VALUE_BYTES {
+            return Err(RegistryReadError {
+                category: "value_too_large".to_owned(),
+                win32_code: None,
+            });
+        }
+
+        let mut data = vec![0_u8; byte_count];
+        let mut actual_byte_count = byte_count as u32;
+        let mut actual_value_type = raw_value_type;
+        let status = unsafe {
+            RegQueryValueExW(
+                key,
+                value_name.as_ptr(),
+                null(),
+                &mut actual_value_type,
+                data.as_mut_ptr().cast(),
+                &mut actual_byte_count,
+            )
+        };
+        if status != 0 {
+            if status == ERROR_MORE_DATA {
+                return Err(RegistryReadError {
+                    category: "value_too_large".to_owned(),
+                    win32_code: Some(status),
+                });
+            }
+            return Err(registry_error(status));
+        }
+        if actual_value_type != raw_value_type {
+            return Err(unsupported_type(actual_value_type));
+        }
+        let actual_byte_count = actual_byte_count as usize;
+        if actual_byte_count > data.len() {
+            return Err(RegistryReadError {
+                category: "value_too_large".to_owned(),
+                win32_code: Some(ERROR_MORE_DATA),
+            });
+        }
+        data.truncate(actual_byte_count);
+        decode_registry_string(&data, value_type)
+    }
+}
+
+#[cfg(windows)]
+fn wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(windows)]
+fn decode_registry_string(
+    data: &[u8],
+    value_type: RegistryValueType,
+) -> Result<RegistryRead, RegistryReadError> {
+    if !data.len().is_multiple_of(2) {
+        return Err(RegistryReadError {
+            category: "invalid_utf16".to_owned(),
+            win32_code: None,
+        });
+    }
+    let units: Vec<u16> = data
+        .chunks(2)
+        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+        .collect();
+    let content_end = units
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(units.len());
+    if units[content_end..].iter().any(|unit| *unit != 0) {
+        return Err(RegistryReadError {
+            category: "embedded_nul".to_owned(),
+            win32_code: None,
+        });
+    }
+    let value = String::from_utf16(&units[..content_end]).map_err(|_| RegistryReadError {
+        category: "invalid_utf16".to_owned(),
+        win32_code: None,
+    })?;
+    Ok(RegistryRead::Present { value_type, value })
+}
+
+#[cfg(windows)]
+fn unsupported_type(value_type: u32) -> RegistryReadError {
+    RegistryReadError {
+        category: "unsupported_type".to_owned(),
+        win32_code: Some(value_type),
+    }
+}
+
+#[cfg(windows)]
+fn registry_error(win32_code: u32) -> RegistryReadError {
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_MORE_DATA};
+
+    RegistryReadError {
+        category: if win32_code == ERROR_ACCESS_DENIED {
+            "access_denied"
+        } else if win32_code == ERROR_MORE_DATA {
+            "value_too_large"
+        } else {
+            "registry_error"
+        }
+        .to_owned(),
+        win32_code: Some(win32_code),
+    }
+}
+
+#[cfg(windows)]
+struct RegistryKey(windows_sys::Win32::System::Registry::HKEY);
+
+#[cfg(windows)]
+impl Drop for RegistryKey {
+    fn drop(&mut self) {
+        unsafe {
+            use windows_sys::Win32::System::Registry::RegCloseKey;
+
+            RegCloseKey(self.0);
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub enum SnapshotResult {
     Present,
@@ -177,6 +384,16 @@ fn sanitized_character_count(value: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reader_returns_typed_results_for_both_targets() {
+        let reader = WindowsShellReader::new();
+        let shell = reader.read(ShellValueTarget::Shell);
+        let userinit = reader.read(ShellValueTarget::Userinit);
+        assert!(shell.is_ok() || shell.as_ref().is_err_and(|e| e.win32_code.is_some()));
+        assert!(userinit.is_ok() || userinit.as_ref().is_err_and(|e| e.win32_code.is_some()));
+    }
 
     struct FixtureReader {
         shell: RegistryReadResult,
