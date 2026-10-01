@@ -167,3 +167,8 @@ produce typed audit events. Rate-limited events omit the unvalidated requested P
   Snapshot failures remain degradable; session or recovery-log failures remain
   startup errors. Focused recovery and snapshot tests, Clippy, formatting, and
   diff checks passed.
+- Task 6: complete (commit `686ef41`, review clean). Wired Task17A startup
+  recovery, read-only HKLM Winlogon snapshot collection, bounded snapshot
+  degradation notices, session state transitions, and ordered normal-exit
+  cleanup into the GUI. Eframe startup failures preserve both recovery markers.
+  GUI tests, Clippy, formatting, and diff checks passed.
