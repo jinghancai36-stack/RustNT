@@ -725,11 +725,31 @@ mod tests {
         let root = TestRoot::new("version");
         let paths = config_paths_from_root(root.path().to_owned());
         std::fs::create_dir_all(root.path()).unwrap();
-        std::fs::write(&paths.shell_snapshot_file, "format_version = 99\n").unwrap();
+        let original = b"format_version = 99\n";
+        std::fs::write(&paths.shell_snapshot_file, original).unwrap();
 
         let error = load_snapshot(&paths).expect_err("unknown version must fail");
         assert!(error.message.contains("unsupported snapshot format"));
-        assert!(paths.shell_snapshot_file.exists());
+        assert_eq!(std::fs::read(&paths.shell_snapshot_file).unwrap(), original);
+    }
+
+    #[test]
+    fn save_snapshot_failure_preserves_existing_file_and_cleans_temporary() {
+        let root = TestRoot::new("save-failure");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let snapshot = fixture_snapshot();
+        save_snapshot(&paths, &snapshot).unwrap();
+        let original = std::fs::read(&paths.shell_snapshot_file).unwrap();
+
+        let invalid_root = root.path().join("invalid-root");
+        std::fs::write(&invalid_root, b"not a directory").unwrap();
+        let mut failing_paths = paths.clone();
+        failing_paths.root = invalid_root;
+
+        let error = save_snapshot(&failing_paths, &snapshot).expect_err("save must fail");
+        assert_eq!(error.operation, "create snapshot directory");
+        assert_eq!(std::fs::read(&paths.shell_snapshot_file).unwrap(), original);
+        assert_no_temporary_snapshots(&paths);
     }
 
     #[test]
