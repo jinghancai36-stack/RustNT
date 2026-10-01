@@ -58,3 +58,29 @@ git diff --check: PASS
 
 The existing Cargo warning about ignored semver metadata in the `toml`
 dependency remains unchanged and is outside Task17A Task 5.
+
+## Third Review Fixes
+
+This pass keeps malformed `shell.session` bytes intact and blocks startup with
+`RecoveryLogError` for invalid UTF-8, invalid TOML, missing required fields,
+invalid states, and other invalid fields. The existing unknown
+`format_version` error remains unchanged. The malformed-session, invalid-UTF-8,
+unknown-state, and missing-field tests now assert errors and exact byte
+equality.
+
+`record_snapshot_result(Err(String::new()))` now records the bounded summary
+`unspecified snapshot error`, so later append and normal completion continue to
+parse successfully. `save_snapshot` rejects unsupported versions before
+creating a temporary file and preserves the existing target bytes.
+
+Verification:
+
+- `cargo fmt --all -- --check`: PASS
+- `cargo test -p rustnt-gui shell_recovery -- --nocapture`: 22 passed.
+- `cargo test -p rustnt-gui shell_snapshot -- --nocapture`: 17 passed.
+- `cargo clippy -p rustnt-gui --all-targets -- -D warnings`: PASS
+- `git diff --check`: PASS
+
+The two focused test filters were run separately because Cargo accepts one test
+filter argument. The existing Cargo warning about ignored semver metadata in
+the `toml` dependency remains unchanged.

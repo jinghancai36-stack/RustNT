@@ -182,11 +182,16 @@ impl ShellSession {
             )?,
             Err(error) => {
                 let summary = sanitize(&error, MAX_EVENT_BYTES);
+                let summary = if summary.is_empty() {
+                    "unspecified snapshot error"
+                } else {
+                    summary.as_str()
+                };
                 append_event(
                     &self.recovery.paths,
                     self.pid,
                     RecoveryEventKind::SnapshotUnavailable,
-                    &summary,
+                    summary,
                 )?;
                 self.write_state_locked("snapshot_unavailable")?;
                 self.set_state(StartupState::SnapshotUnavailable)?;
@@ -362,29 +367,49 @@ fn read_session_file(path: &Path) -> Result<Option<SessionFile>, RecoveryLogErro
     let Some(bytes) = read_bounded_file(path, MAX_SESSION_BYTES, "read shell session")? else {
         return Ok(None);
     };
-    let encoded = match String::from_utf8(bytes) {
-        Ok(encoded) => encoded,
-        Err(_) => return Ok(None),
-    };
-    let value = match toml::from_str::<toml::Value>(&encoded) {
-        Ok(value) => value,
-        Err(_) => return Ok(None),
-    };
-    if let Some(version) = value
-        .get("format_version")
-        .and_then(toml::Value::as_integer)
-    {
-        if version != i64::from(SESSION_FORMAT_VERSION) {
-            return Err(RecoveryLogError::new(
-                "read shell session",
-                format!("unsupported shell session format_version {version}"),
-            ));
-        }
+    let encoded = String::from_utf8(bytes).map_err(|_| {
+        RecoveryLogError::new(
+            "read shell session",
+            "malformed shell session: invalid UTF-8",
+        )
+    })?;
+    let value = toml::from_str::<toml::Value>(&encoded).map_err(|error| {
+        RecoveryLogError::new(
+            "read shell session",
+            format!("malformed shell session: invalid TOML: {error}"),
+        )
+    })?;
+    let version_value = value.get("format_version").ok_or_else(|| {
+        RecoveryLogError::new(
+            "read shell session",
+            "malformed shell session: missing format_version",
+        )
+    })?;
+    let version = version_value.as_integer().ok_or_else(|| {
+        RecoveryLogError::new(
+            "read shell session",
+            "malformed shell session: invalid format_version",
+        )
+    })?;
+    if version != i64::from(SESSION_FORMAT_VERSION) {
+        return Err(RecoveryLogError::new(
+            "read shell session",
+            format!("unsupported shell session format_version {version}"),
+        ));
     }
-    let session = match toml::from_str::<SessionFile>(&encoded) {
-        Ok(session) if session.is_valid() => session,
-        Ok(_) | Err(_) => return Ok(None),
-    };
+
+    let session = toml::from_str::<SessionFile>(&encoded).map_err(|error| {
+        RecoveryLogError::new(
+            "read shell session",
+            format!("malformed shell session: invalid fields: {error}"),
+        )
+    })?;
+    if !session.is_valid() {
+        return Err(RecoveryLogError::new(
+            "read shell session",
+            "malformed shell session: invalid fields",
+        ));
+    }
     Ok(Some(session))
 }
 
@@ -744,6 +769,24 @@ mod tests {
     }
 
     #[test]
+    fn empty_snapshot_error_writes_parseable_summary_and_allows_completion() {
+        let root = TestRoot::new("empty-snapshot-error");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let (_recovery, session) = ShellRecovery::begin_startup(&paths, 1, 2).unwrap();
+
+        session.record_snapshot_result(Err(String::new())).unwrap();
+        session
+            .record_snapshot_result(Err("later failure".to_owned()))
+            .unwrap();
+        session.complete_normal_exit().unwrap();
+
+        let log = std::fs::read_to_string(&paths.shell_recovery_log).unwrap();
+        assert!(log.contains("result=unspecified snapshot error"));
+        assert!(log.contains("event=completed"));
+        assert!(log.lines().skip(1).all(parse_event_line));
+    }
+
+    #[test]
     fn normal_exit_logs_completed_then_removes_current_session() {
         let root = TestRoot::new("normal-exit");
         let paths = config_paths_from_root(root.path().to_owned());
@@ -793,53 +836,59 @@ mod tests {
     }
 
     #[test]
-    fn malformed_old_session_is_replaced_atomically() {
+    fn malformed_old_session_blocks_startup_without_rewriting_bytes() {
         let root = TestRoot::new("malformed-session");
         let paths = config_paths_from_root(root.path().to_owned());
         std::fs::create_dir_all(root.path()).unwrap();
-        std::fs::write(&paths.shell_session_file, b"not toml\0").unwrap();
-        let (_recovery, session) = ShellRecovery::begin_startup(&paths, 3, 4).unwrap();
-        assert!(session.path().exists());
-        assert!(std::fs::read_to_string(&paths.shell_session_file)
-            .unwrap()
-            .contains("format_version"));
+        let original = b"not toml\0";
+        std::fs::write(&paths.shell_session_file, original).unwrap();
+
+        let error = ShellRecovery::begin_startup(&paths, 3, 4)
+            .expect_err("malformed session must block startup");
+        assert!(error.message.contains("malformed shell session"));
+        assert_eq!(std::fs::read(&paths.shell_session_file).unwrap(), original);
     }
 
     #[test]
-    fn invalid_utf8_old_session_is_treated_as_malformed() {
+    fn invalid_utf8_old_session_blocks_startup_without_rewriting_bytes() {
         let root = TestRoot::new("invalid-utf8-session");
         let paths = config_paths_from_root(root.path().to_owned());
         std::fs::create_dir_all(root.path()).unwrap();
-        std::fs::write(&paths.shell_session_file, [0xff, 0xfe, 0x00]).unwrap();
+        let original = [0xff, 0xfe, 0x00];
+        std::fs::write(&paths.shell_session_file, original).unwrap();
 
-        let (_recovery, session) = ShellRecovery::begin_startup(&paths, 3, 4).unwrap();
-        assert!(session.path().exists());
-        assert_ne!(
-            std::fs::read(&paths.shell_session_file).unwrap(),
-            [0xff, 0xfe, 0x00]
-        );
-        assert!(std::fs::read_to_string(&paths.shell_session_file)
-            .unwrap()
-            .contains("format_version"));
-        let log = std::fs::read_to_string(&paths.shell_recovery_log).unwrap();
-        assert!(!log.contains("event=recovery_required"));
+        let error = ShellRecovery::begin_startup(&paths, 3, 4)
+            .expect_err("invalid UTF-8 session must block startup");
+        assert!(error.message.contains("invalid UTF-8"));
+        assert_eq!(std::fs::read(&paths.shell_session_file).unwrap(), original);
     }
 
     #[test]
-    fn unknown_session_state_is_treated_as_malformed() {
+    fn unknown_session_state_blocks_startup_without_rewriting_bytes() {
         let root = TestRoot::new("unknown-session-state");
         let paths = config_paths_from_root(root.path().to_owned());
         std::fs::create_dir_all(root.path()).unwrap();
-        std::fs::write(
-            &paths.shell_session_file,
-            "format_version = 1\npid = 7\nstarted_at = 8\nnonce = 'fixture-nonce'\nstate = 'future_state'\n",
-        )
-        .unwrap();
+        let original = b"format_version = 1\npid = 7\nstarted_at = 8\nnonce = 'fixture-nonce'\nstate = 'future_state'\n";
+        std::fs::write(&paths.shell_session_file, original).unwrap();
 
-        let (recovery, _session) = ShellRecovery::begin_startup(&paths, 3, 4).unwrap();
-        assert_eq!(recovery.startup_state(), StartupState::Starting);
-        let log = std::fs::read_to_string(&paths.shell_recovery_log).unwrap();
-        assert!(!log.contains("event=recovery_required"));
+        let error = ShellRecovery::begin_startup(&paths, 3, 4)
+            .expect_err("unknown session state must block startup");
+        assert!(error.message.contains("malformed shell session"));
+        assert_eq!(std::fs::read(&paths.shell_session_file).unwrap(), original);
+    }
+
+    #[test]
+    fn session_missing_required_field_blocks_startup_without_rewriting_bytes() {
+        let root = TestRoot::new("missing-session-field");
+        let paths = config_paths_from_root(root.path().to_owned());
+        std::fs::create_dir_all(root.path()).unwrap();
+        let original = b"format_version = 1\npid = 7\nstarted_at = 8\nstate = 'running'\n";
+        std::fs::write(&paths.shell_session_file, original).unwrap();
+
+        let error = ShellRecovery::begin_startup(&paths, 3, 4)
+            .expect_err("session missing required field must block startup");
+        assert!(error.message.contains("malformed shell session"));
+        assert_eq!(std::fs::read(&paths.shell_session_file).unwrap(), original);
     }
 
     #[test]

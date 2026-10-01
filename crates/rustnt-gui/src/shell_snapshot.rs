@@ -313,6 +313,15 @@ impl fmt::Display for SnapshotError {
 impl std::error::Error for SnapshotError {}
 
 pub fn save_snapshot(paths: &ConfigPaths, snapshot: &ShellSnapshot) -> Result<(), SnapshotError> {
+    if snapshot.format_version != FORMAT_VERSION {
+        return Err(SnapshotError::new(
+            "validate snapshot",
+            format!(
+                "unsupported snapshot format: version {}",
+                snapshot.format_version
+            ),
+        ));
+    }
     std::fs::create_dir_all(&paths.root)
         .map_err(|error| SnapshotError::new("create snapshot directory", error))?;
     let encoded = toml::to_string_pretty(snapshot)
@@ -755,6 +764,22 @@ mod tests {
         std::fs::write(&paths.shell_snapshot_file, original).unwrap();
 
         let error = load_snapshot(&paths).expect_err("unknown version must fail");
+        assert!(error.message.contains("unsupported snapshot format"));
+        assert_eq!(std::fs::read(&paths.shell_snapshot_file).unwrap(), original);
+    }
+
+    #[test]
+    fn save_rejects_unknown_snapshot_version_without_replacing_existing_file() {
+        let root = TestRoot::new("save-version");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let valid_snapshot = fixture_snapshot();
+        save_snapshot(&paths, &valid_snapshot).unwrap();
+        let original = std::fs::read(&paths.shell_snapshot_file).unwrap();
+        let mut unsupported_snapshot = valid_snapshot;
+        unsupported_snapshot.format_version = FORMAT_VERSION + 1;
+
+        let error = save_snapshot(&paths, &unsupported_snapshot)
+            .expect_err("unknown snapshot version must be rejected");
         assert!(error.message.contains("unsupported snapshot format"));
         assert_eq!(std::fs::read(&paths.shell_snapshot_file).unwrap(), original);
     }
