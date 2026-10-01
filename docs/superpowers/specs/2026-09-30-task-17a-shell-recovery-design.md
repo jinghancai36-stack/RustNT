@@ -8,10 +8,10 @@
 
 Task17A 为后续可选的 Shell 集成建立只读、可审计、可恢复的基础能力：
 
-- 读取当前用户的 Windows Shell 配置并生成版本化快照；
+- 读取 Windows Winlogon 的 Shell 配置并生成版本化快照；
 - 记录 RustNT 启动事务、正常退出、异常退出和恢复事件；
 - 将快照和日志限制在 `%APPDATA%\\RustNT` 应用数据目录；
-- 在快照或日志不可用时允许 GUI 继续启动；
+- 在 Shell 快照不可用时允许 GUI 继续启动；事务标记或恢复日志不可用时拒绝启动，避免把不可恢复状态误报为安全；
 - 为未来 Task17B 的手动 Shell 切换提供状态和恢复证据，但不执行切换。
 
 ## 2. 明确不包含
@@ -68,10 +68,11 @@ Task14 已提供 `ConfigPaths`、运行标记、崩溃日志和异常启动恢�
 - 成功、缺失或读取失败的结果；
 - 失败时的受限错误类别和 Win32 错误码（如可用）。
 
-Task17A 读取当前用户范围的 Winlogon Shell 配置：
+Task17A 只读读取系统 Winlogon Shell 配置。标准 Windows Winlogon 配置位于
+`HKLM`，因此本任务不读取用户自定义的同名路径：
 
-- `HKCU\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\Shell`；
-- `HKCU\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\Userinit`。
+- `HKLM\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\Shell`；
+- `HKLM\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\Userinit`。
 
 注册表读取通过 Windows API 封装在窄接口中。生产实现不使用外部命令；测试
 通过注入式读取器提供固定结果。快照默认不保存完整值，只保存受限长度和
@@ -87,7 +88,7 @@ Task17A 读取当前用户范围的 Winlogon Shell 配置：
 - `Completed`：正常退出已经记录并完成清理；
 - `RecoveryRequired`：发现上一事务未完成；
 - `RecoveryRecorded`：恢复事件已写入本地日志；
-- `SnapshotUnavailable`：快照读取或保存失败，但 GUI 仍可启动。
+- `SnapshotUnavailable`：快照读取或保存失败；GUI 可继续启动并显示降级通知。
 
 启动流程：
 
@@ -100,8 +101,9 @@ Task17A 读取当前用户范围的 Winlogon Shell 配置：
 7. GUI 正常退出时追加 `completed` 事件并删除本次事务标记。
 8. 强制终止或崩溃时保留事务标记，由下一次启动识别。
 
-启动阶段的恢复记录失败不得伪装成成功。若无法写入日志或事务标记，错误
-必须返回给现有 GUI 启动错误处理；快照单独失败则只降级为可见通知并继续。
+启动阶段的恢复记录失败不得伪装成成功。若无法写入恢复日志或事务标记，错误
+必须返回给现有 GUI 启动错误处理并阻止打开窗口；快照读取或快照文件替换失败
+则只降级为可见通知并继续。这样只有恢复链路本身可用时，GUI 才会进入运行状态。
 
 ## 6. 日志与错误处理
 
@@ -142,7 +144,7 @@ Task17A 读取当前用户范围的 Winlogon Shell 配置：
 
 - 无旧事务时正常进入 `Running`；
 - 未完成事务触发一次 `recovery_required`；
-- 快照失败仍可进入 `Running` 并记录 `snapshot_unavailable`；
+- 快照失败仍可进入 `Running` 并记录 `snapshot_unavailable`；恢复日志或事务标记失败时不能进入 `Running`；
 - 正常退出记录 `completed` 并删除当前事务标记；
 - 异常终止模拟保留事务标记，下一次启动可恢复识别；
 - Task14 运行标记、崩溃恢复和配置读写测试继续通过；
@@ -152,7 +154,7 @@ Task17A 读取当前用户范围的 Winlogon Shell 配置：
 
 1. Task17A 只读取当前用户 Shell 配置，不修改 Windows Shell 或注册表。
 2. 快照、事务标记和恢复日志只写入 `%APPDATA%\\RustNT`。
-3. 发生快照读取或保存错误时，GUI 仍能启动并保留可见错误结果。
+3. 发生快照读取或保存错误时，GUI 仍能启动并保留可见错误结果；恢复日志或事务标记不可用时拒绝启动。
 4. 异常终止可由下一次启动识别，正常退出可以完成事务清理。
 5. 所有持久化文件有版本、大小限制和失败保留策略。
 6. 新增逻辑有注入式单元测试，且不依赖真实用户注册表内容。

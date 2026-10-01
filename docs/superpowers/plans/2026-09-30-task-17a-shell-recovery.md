@@ -10,12 +10,12 @@
 
 ## Global Constraints
 
-- Read only \`HKCU\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\Shell\` and \`Userinit\`.
+- Read only \`HKLM\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\Shell\` and \`Userinit\`.
 - Never write or delete registry values; never change Windows Shell configuration.
 - Never launch, stop, restart, or control Explorer or any external process.
 - Store all new files under \`%APPDATA%\\RustNT\`; do not change services, pipes, drivers, kernel, or privileges.
 - Persist bounded metadata and a digest; never persist complete registry values.
-- Snapshot failure is a degraded notice and must not block GUI startup; session/log failures remain startup errors.
+- Snapshot failure is a degraded notice and must not block GUI startup; session/log failures block GUI startup.
 - Every persistent format has \`format_version\`; corrupt or unknown data is preserved.
 - Unit tests use injected readers and temporary directories, not the user's registry.
 
@@ -170,7 +170,7 @@ fn windows_reader_returns_typed_results_for_both_targets() {
 
 - [ ] **Step 2: Implement the narrow wrapper**
 
-Under \`cfg(windows)\`, use only \`RegOpenKeyExW\`, \`RegQueryValueExW\`, and \`RegCloseKey\`. Open \`HKEY_CURRENT_USER\` with \`KEY_QUERY_VALUE\`. Map missing values, bounded access errors, unsupported types, UTF-16 decoding errors, and embedded NULs to typed results. Do not call registry writes, process-launch APIs, \`Command\`, PowerShell, \`reg.exe\`, or Explorer APIs.
+Under \`cfg(windows)\`, use only \`RegOpenKeyExW\`, \`RegQueryValueExW\`, and \`RegCloseKey\`. Open \`HKEY_LOCAL_MACHINE\` with \`KEY_QUERY_VALUE\`. Map missing values, bounded access errors, unsupported types, UTF-16 decoding errors, and embedded NULs to typed results. Do not call registry writes, process-launch APIs, \`Command\`, PowerShell, \`reg.exe\`, or Explorer APIs.
 
 - [ ] **Step 3: Verify and commit**
 
@@ -358,7 +358,7 @@ Expected: Cargo and diff checks exit 0; the boundary scan finds no prohibited ca
 
 - [ ] **Step 4: Run a disposable Windows smoke check**
 
-Use isolated \`APPDATA\`; launch only the built GUI as a normal user; verify snapshot/session/log creation; terminate and relaunch; verify \`recovery_required\`. Do not modify HKCU, Explorer, services, or startup settings. Remove only the disposable directory.
+Use isolated \`APPDATA\`; launch only the built GUI as a normal user; verify snapshot/session/log creation; terminate and relaunch; verify \`recovery_required\`. Do not modify HKLM, HKCU, Explorer, services, or startup settings. Remove only the disposable directory.
 
 - [ ] **Step 5: Review, document, and commit**
 
