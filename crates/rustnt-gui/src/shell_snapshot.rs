@@ -99,6 +99,19 @@ fn snapshot_value(reader: &impl ShellValueReader, target: ShellValueTarget) -> S
             digest: String::new(),
         },
         Ok(RegistryRead::Present { value_type, value }) => {
+            if value.len() > MAX_VALUE_BYTES {
+                return ShellValueSnapshot {
+                    target,
+                    value_type: Some(value_type),
+                    result: SnapshotResult::Failed {
+                        category: "value_too_large".to_owned(),
+                        win32_code: None,
+                    },
+                    character_count: 0,
+                    digest: String::new(),
+                };
+            }
+
             let digest = fnv1a64_digest(&value);
             if value.contains('\0') {
                 return ShellValueSnapshot {
@@ -251,7 +264,8 @@ mod tests {
 
     #[test]
     fn collect_snapshot_sanitizes_controls_and_bounds_metadata() {
-        let value = format!("prefix\t\r\n{}", "x".repeat(MAX_VALUE_BYTES));
+        let prefix = "prefix\t\r\n";
+        let value = format!("{prefix}{}", "x".repeat(MAX_VALUE_BYTES - prefix.len()));
         let reader =
             FixtureReader::with_values(Some((RegistryValueType::String, value.as_str())), None);
 
@@ -263,5 +277,48 @@ mod tests {
         assert!(!format!("{snapshot:?}").contains('\t'));
         assert!(!format!("{snapshot:?}").contains('\r'));
         assert!(!format!("{snapshot:?}").contains('\n'));
+    }
+
+    #[test]
+    fn collect_snapshot_rejects_values_over_the_input_bound() {
+        let value = format!("{}\0ignored", "x".repeat(MAX_VALUE_BYTES + 1));
+        let reader =
+            FixtureReader::with_values(Some((RegistryValueType::String, value.as_str())), None);
+
+        let snapshot = collect_snapshot(&reader, 10, 20);
+
+        assert_eq!(
+            snapshot.entries[0].result,
+            SnapshotResult::Failed {
+                category: "value_too_large".to_owned(),
+                win32_code: None,
+            }
+        );
+        assert_eq!(snapshot.entries[0].character_count, 0);
+        assert!(snapshot.entries[0].digest.is_empty());
+    }
+
+    #[test]
+    fn collect_snapshot_toml_contains_metadata_without_registry_strings() {
+        let shell_value = "explorer.exe --secret";
+        let userinit_value = "%SystemRoot%\\system32\\userinit.exe --secret";
+        let reader = FixtureReader::with_values(
+            Some((RegistryValueType::String, shell_value)),
+            Some((RegistryValueType::ExpandString, userinit_value)),
+        );
+
+        let snapshot = collect_snapshot(&reader, 10, 20);
+        let serialized = toml::to_string(&snapshot).expect("snapshot should serialize as TOML");
+
+        assert!(!serialized.contains(shell_value));
+        assert!(!serialized.contains(userinit_value));
+        assert!(serialized.contains("format_version"));
+        assert!(serialized.contains("captured_at_unix_seconds"));
+        assert!(serialized.contains("process_id"));
+        assert!(serialized.contains("target"));
+        assert!(serialized.contains("value_type"));
+        assert!(serialized.contains("result"));
+        assert!(serialized.contains("character_count"));
+        assert!(serialized.contains("digest"));
     }
 }
