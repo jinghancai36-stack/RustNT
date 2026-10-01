@@ -213,10 +213,10 @@ fn decode_registry_string(
 }
 
 #[cfg(windows)]
-fn unsupported_type(value_type: u32) -> RegistryReadError {
+fn unsupported_type(_value_type: u32) -> RegistryReadError {
     RegistryReadError {
         category: "unsupported_type".to_owned(),
-        win32_code: Some(value_type),
+        win32_code: None,
     }
 }
 
@@ -393,6 +393,12 @@ mod tests {
         let userinit = reader.read(ShellValueTarget::Userinit);
         assert!(shell.is_ok() || shell.as_ref().is_err_and(|e| e.win32_code.is_some()));
         assert!(userinit.is_ok() || userinit.as_ref().is_err_and(|e| e.win32_code.is_some()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unsupported_type_does_not_store_registry_type_as_win32_code() {
+        assert_eq!(unsupported_type(1234).win32_code, None);
     }
 
     struct FixtureReader {
