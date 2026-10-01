@@ -172,3 +172,9 @@ produce typed audit events. Rate-limited events omit the unvalidated requested P
   degradation notices, session state transitions, and ordered normal-exit
   cleanup into the GUI. Eframe startup failures preserve both recovery markers.
   GUI tests, Clippy, formatting, and diff checks passed.
+- Task 7/final docs: complete. Updated `docs/roadmap.md` for the completed
+  Task16 scope, completed Task17A, and the Task17B design review next step;
+  created `.superpowers/sdd/task-17a-report.md` with measured verification
+  results and explicit GUI smoke-test status. The final serial workspace test,
+  check, build, Clippy, format, diff, and boundary-scan commands were run on
+  2026-10-01. No real GUI smoke test was executed.
