@@ -753,6 +753,22 @@ mod tests {
     }
 
     #[test]
+    fn replace_snapshot_failure_preserves_existing_target_bytes() {
+        let root = TestRoot::new("replace-failure");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let original = b"existing snapshot bytes\n";
+        let temporary = root.path().join("missing.tmp");
+        std::fs::create_dir_all(root.path()).unwrap();
+        std::fs::write(&paths.shell_snapshot_file, original).unwrap();
+
+        let error = replace_snapshot_file(&temporary, &paths.shell_snapshot_file)
+            .expect_err("missing temporary snapshot must fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(std::fs::read(&paths.shell_snapshot_file).unwrap(), original);
+    }
+
+    #[test]
     fn collect_snapshot_records_metadata_without_full_value() {
         let reader = FixtureReader::with_values(
             Some((RegistryValueType::String, "explorer.exe\0ignored")),
