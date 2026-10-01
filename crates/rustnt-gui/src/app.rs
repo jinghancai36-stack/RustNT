@@ -10,6 +10,7 @@ use crate::navigation::{
 };
 use crate::notifications::{NotificationCenter, NotificationKind};
 use crate::recovery::RecoveryState;
+use crate::shell_recovery::StartupNotice;
 
 const RECOVERY_NOTICE: &str = "Previous run did not exit normally. Safe defaults are active.";
 const UNCONNECTED_DATA_SOURCE: &str = "Data source is not connected yet.";
@@ -35,10 +36,14 @@ impl RustNtApp {
         paths: ConfigPaths,
         recovery: RecoveryState,
         config_notice: Option<String>,
+        startup_notice: Option<StartupNotice>,
     ) -> Self {
         let mut notifications = NotificationCenter::new();
         if let Some(notice) = &config_notice {
             notifications.push(NotificationKind::Warning, notice.clone());
+        }
+        if let Some(notice) = startup_notice {
+            notifications.push(notice.kind, notice.message);
         }
         if recovery.previous_run_incomplete {
             notifications.push(NotificationKind::Warning, RECOVERY_NOTICE);
@@ -734,6 +739,7 @@ mod tests {
 
     use crate::config::{config_paths_from_root, GuiConfig, ThemeMode};
     use crate::navigation::PageId;
+    use crate::notifications::NotificationKind;
     use crate::recovery::RecoveryState;
 
     use super::{
@@ -778,7 +784,36 @@ mod tests {
                 previous_run_incomplete: false,
             },
             config_notice,
+            None,
         )
+    }
+
+    #[test]
+    fn shell_startup_notice_is_enqueued_once_with_its_severity_and_message() {
+        let startup_notice = crate::shell_recovery::StartupNotice {
+            kind: NotificationKind::Error,
+            message: "Shell snapshot unavailable: access denied".to_owned(),
+        };
+        let app = RustNtApp::new(
+            Arc::new(Mutex::new(GuiConfig::default())),
+            config_paths_from_root(PathBuf::from("task17a-app-tests")),
+            RecoveryState {
+                previous_run_incomplete: false,
+            },
+            None,
+            Some(startup_notice),
+        );
+
+        assert_eq!(app.notifications.notifications().len(), 1);
+        assert_eq!(app.notifications.unread_count(), 1);
+        assert_eq!(
+            app.notifications.notifications()[0].kind,
+            NotificationKind::Error
+        );
+        assert_eq!(
+            app.notifications.notifications()[0].message,
+            "Shell snapshot unavailable: access denied"
+        );
     }
 
     fn run_input(app: &mut RustNtApp, context: &egui::Context, input: egui::RawInput) {

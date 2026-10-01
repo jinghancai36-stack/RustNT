@@ -11,15 +11,23 @@ pub mod shell_snapshot;
 
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use app::{viewport_for, RustNtApp, SharedConfig};
 use config::{config_paths_from_appdata, load_config, save_config, ConfigError, GuiConfig};
 use recovery::{create_marker, inspect, install_panic_hook, RecoveryError};
+use shell_recovery::{
+    startup_notice, RecoveryLogError, ShellRecovery, StartupNotice, StartupOutcome,
+};
+use shell_snapshot::{
+    collect_snapshot, save_snapshot, ShellSnapshot, SnapshotResult, WindowsShellReader,
+};
 
 #[derive(Debug)]
 enum GuiError {
     Config(ConfigError),
     Recovery(RecoveryError),
+    ShellRecovery(RecoveryLogError),
     ConfigLock,
     Eframe(eframe::Error),
 }
@@ -29,6 +37,7 @@ impl fmt::Display for GuiError {
         match self {
             Self::Config(error) => write!(formatter, "configuration error: {error}"),
             Self::Recovery(error) => write!(formatter, "recovery error: {error}"),
+            Self::ShellRecovery(error) => write!(formatter, "shell recovery error: {error}"),
             Self::ConfigLock => write!(formatter, "configuration lock is poisoned"),
             Self::Eframe(error) => write!(formatter, "GUI error: {error}"),
         }
@@ -46,6 +55,12 @@ impl From<ConfigError> for GuiError {
 impl From<RecoveryError> for GuiError {
     fn from(error: RecoveryError) -> Self {
         Self::Recovery(error)
+    }
+}
+
+impl From<RecoveryLogError> for GuiError {
+    fn from(error: RecoveryLogError) -> Self {
+        Self::ShellRecovery(error)
     }
 }
 
@@ -73,7 +88,7 @@ fn aggregate_cleanup_errors(errors: impl IntoIterator<Item = GuiError>) -> Resul
 fn cleanup_error_priority(error: &GuiError) -> u8 {
     match error {
         GuiError::Config(_) | GuiError::ConfigLock => 0,
-        GuiError::Recovery(_) => 1,
+        GuiError::Recovery(_) | GuiError::ShellRecovery(_) => 1,
         GuiError::Eframe(_) => 2,
     }
 }
@@ -81,7 +96,8 @@ fn cleanup_error_priority(error: &GuiError) -> u8 {
 fn cleanup_after_normal_exit(
     shared: &SharedConfig,
     save: impl FnOnce(&GuiConfig) -> Result<(), ConfigError>,
-    remove: impl FnOnce() -> Result<(), RecoveryError>,
+    complete_shell_session: impl FnOnce() -> Result<(), RecoveryLogError>,
+    remove_gui_marker: impl FnOnce() -> Result<(), RecoveryError>,
 ) -> Result<(), GuiError> {
     let final_config = match shared.lock() {
         Ok(config) => Ok(config.clone()),
@@ -96,10 +112,49 @@ fn cleanup_after_normal_exit(
         }
         Err(error) => cleanup_errors.push(error),
     }
-    if let Err(error) = remove() {
+    if let Err(error) = complete_shell_session() {
+        cleanup_errors.push(error.into());
+    }
+    if let Err(error) = remove_gui_marker() {
         cleanup_errors.push(error.into());
     }
     aggregate_cleanup_errors(cleanup_errors)
+}
+
+fn run_after_startup(
+    prepare: impl FnOnce() -> Result<(), GuiError>,
+    open_window: impl FnOnce() -> Result<(), eframe::Error>,
+    cleanup: impl FnOnce() -> Result<(), GuiError>,
+) -> Result<(), GuiError> {
+    prepare()?;
+    finish_run_native(open_window(), cleanup)
+}
+
+fn snapshot_failure_summary(snapshot: &ShellSnapshot) -> Option<String> {
+    snapshot.entries.iter().find_map(|entry| {
+        let SnapshotResult::Failed {
+            category,
+            win32_code,
+        } = &entry.result
+        else {
+            return None;
+        };
+        let target = match entry.target {
+            shell_snapshot::ShellValueTarget::Shell => "Shell",
+            shell_snapshot::ShellValueTarget::Userinit => "Userinit",
+        };
+        Some(match win32_code {
+            Some(code) => format!("{target} read failed: {category} (Windows error {code})"),
+            None => format!("{target} read failed: {category}"),
+        })
+    })
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn finish_run_native(
@@ -121,31 +176,63 @@ fn run_gui() -> Result<(), GuiError> {
     let marker = create_marker(&paths)?;
     install_panic_hook(paths.crash_log.clone());
     let shared: SharedConfig = Arc::new(Mutex::new(config.clone()));
+    let (_shell_recovery, shell_session) =
+        ShellRecovery::begin_startup(&paths, std::process::id(), unix_timestamp())?;
+    let snapshot = collect_snapshot(
+        &WindowsShellReader::new(),
+        unix_timestamp(),
+        std::process::id(),
+    );
+    let mut snapshot_failure = snapshot_failure_summary(&snapshot);
+    if let Err(error) = save_snapshot(&paths, &snapshot) {
+        snapshot_failure = Some(match snapshot_failure {
+            Some(previous) => format!("{previous}; snapshot save failed: {error}"),
+            None => format!("snapshot save failed: {error}"),
+        });
+    }
+    let startup_notice: Option<StartupNotice> = match snapshot_failure {
+        Some(summary) => {
+            shell_session.record_snapshot_result(Err(summary.clone()))?;
+            startup_notice(StartupOutcome::SnapshotUnavailable(summary))
+        }
+        None => {
+            shell_session.record_snapshot_result(Ok(()))?;
+            None
+        }
+    };
+    shell_session.mark_running()?;
     let options = eframe::NativeOptions {
         viewport: viewport_for(&config, recovery),
         ..Default::default()
     };
     let shared_for_app = Arc::clone(&shared);
     let paths_for_app = paths.clone();
-    let result = eframe::run_native(
-        "RustNT",
-        options,
-        Box::new(move |_creation_context| {
-            Ok(Box::new(RustNtApp::new(
-                shared_for_app,
-                paths_for_app,
-                recovery,
-                load.notice,
-            )))
-        }),
-    );
-    finish_run_native(result, || {
-        cleanup_after_normal_exit(
-            &shared,
-            |final_config| save_config(&paths, final_config),
-            || marker.remove(),
-        )
-    })
+    run_after_startup(
+        || Ok(()),
+        || {
+            eframe::run_native(
+                "RustNT",
+                options,
+                Box::new(move |_creation_context| {
+                    Ok(Box::new(RustNtApp::new(
+                        shared_for_app,
+                        paths_for_app,
+                        recovery,
+                        load.notice,
+                        startup_notice,
+                    )))
+                }),
+            )
+        },
+        || {
+            cleanup_after_normal_exit(
+                &shared,
+                |final_config| save_config(&paths, final_config),
+                || shell_session.complete_normal_exit(),
+                || marker.remove(),
+            )
+        },
+    )
 }
 
 fn main() {
@@ -158,11 +245,12 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        aggregate_cleanup_errors, cleanup_after_normal_exit, finish_run_native, startup_config,
-        GuiError,
+        aggregate_cleanup_errors, cleanup_after_normal_exit, finish_run_native, run_after_startup,
+        startup_config, GuiError,
     };
     use crate::config::{ConfigError, GuiConfig, ThemeMode};
     use crate::recovery::{RecoveryError, RecoveryState};
+    use crate::shell_recovery::RecoveryLogError;
     use std::sync::{Arc, Mutex};
 
     fn recovery_error() -> RecoveryError {
@@ -176,6 +264,13 @@ mod tests {
         ConfigError {
             operation: "save configuration".to_owned(),
             message: "disk full".to_owned(),
+        }
+    }
+
+    fn shell_recovery_error() -> RecoveryLogError {
+        RecoveryLogError {
+            operation: "complete shell session".to_owned(),
+            message: "access denied".to_owned(),
         }
     }
 
@@ -196,10 +291,88 @@ mod tests {
                 remove_called = true;
                 Ok(())
             },
+            || Ok(()),
         );
 
         assert!(result.is_ok());
         assert!(remove_called);
+    }
+
+    #[test]
+    fn normal_cleanup_completes_task17a_before_removing_legacy_marker() {
+        let shared = Arc::new(Mutex::new(GuiConfig::default()));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let save_calls = Arc::clone(&calls);
+        let complete_calls = Arc::clone(&calls);
+        let remove_calls = Arc::clone(&calls);
+
+        cleanup_after_normal_exit(
+            &shared,
+            |_| {
+                save_calls.lock().unwrap().push("save config");
+                Ok(())
+            },
+            || {
+                complete_calls.lock().unwrap().push("complete Task17A");
+                Ok(())
+            },
+            || {
+                remove_calls.lock().unwrap().push("remove GUI marker");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["save config", "complete Task17A", "remove GUI marker"]
+        );
+    }
+
+    #[test]
+    fn shell_session_startup_failure_prevents_opening_window() {
+        let mut window_opened = false;
+        let result = run_after_startup(
+            || {
+                Err(GuiError::ShellRecovery(
+                    crate::shell_recovery::RecoveryLogError {
+                        operation: "create shell session".to_owned(),
+                        message: "access denied".to_owned(),
+                    },
+                ))
+            },
+            || {
+                window_opened = true;
+                Ok(())
+            },
+            || Ok(()),
+        );
+
+        assert!(matches!(result, Err(GuiError::ShellRecovery(_))));
+        assert!(!window_opened);
+    }
+
+    #[test]
+    fn eframe_error_skips_both_task17a_and_legacy_marker_cleanup() {
+        let mut task17a_cleanup_called = false;
+        let mut gui_marker_cleanup_called = false;
+        let result = run_after_startup(
+            || Ok(()),
+            || {
+                Err(eframe::Error::AppCreation(Box::new(std::io::Error::other(
+                    "window failed",
+                ))))
+            },
+            || {
+                task17a_cleanup_called = true;
+                gui_marker_cleanup_called = true;
+                Ok(())
+            },
+        );
+
+        assert!(matches!(result, Err(GuiError::Eframe(_))));
+        assert!(!task17a_cleanup_called);
+        assert!(!gui_marker_cleanup_called);
     }
 
     #[test]
@@ -212,8 +385,9 @@ mod tests {
             |_| Err(config_error()),
             || {
                 remove_called = true;
-                Err(recovery_error())
+                Err(shell_recovery_error())
             },
+            || Err(recovery_error()),
         )
         .expect_err("save failure should be returned");
 
@@ -240,8 +414,9 @@ mod tests {
             },
             || {
                 remove_called = true;
-                Err(recovery_error())
+                Err(shell_recovery_error())
             },
+            || Err(recovery_error()),
         )
         .expect_err("lock failure should be returned");
 

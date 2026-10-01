@@ -1,4 +1,5 @@
 use crate::config::ConfigPaths;
+use crate::notifications::NotificationKind;
 use std::fmt;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -123,6 +124,26 @@ pub struct ShellSession {
     started_at: u64,
     nonce: String,
     path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupNotice {
+    pub kind: NotificationKind,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartupOutcome {
+    SnapshotUnavailable(String),
+}
+
+pub fn startup_notice(outcome: StartupOutcome) -> Option<StartupNotice> {
+    match outcome {
+        StartupOutcome::SnapshotUnavailable(summary) => Some(StartupNotice {
+            kind: NotificationKind::Warning,
+            message: sanitize(&format!("Shell snapshot unavailable: {summary}"), 160),
+        }),
+    }
 }
 
 impl ShellRecovery {
@@ -730,6 +751,21 @@ mod tests {
 
     fn fixture_session_toml() -> &'static str {
         "format_version = 1\npid = 7\nstarted_at = 8\nnonce = 'fixture-nonce'\nstate = 'running'\n"
+    }
+
+    #[test]
+    fn snapshot_startup_notice_is_bounded_and_contains_only_the_summary() {
+        let notice = startup_notice(StartupOutcome::SnapshotUnavailable(format!(
+            "registry access denied {}",
+            "x".repeat(200)
+        )))
+        .expect("snapshot failure should produce a notice");
+
+        assert!(notice
+            .message
+            .starts_with("Shell snapshot unavailable: registry access denied"));
+        assert!(notice.message.chars().count() <= 160);
+        assert_eq!(notice.kind, crate::notifications::NotificationKind::Warning);
     }
 
     #[test]
