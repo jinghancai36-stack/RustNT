@@ -160,3 +160,10 @@ produce typed audit events. Rate-limited events omit the unvalidated requested P
   metadata-only TOML snapshot persistence with unique temporary files, atomic
   replacement, unknown/corrupt-file preservation, failure cleanup, and direct
   replacement-failure coverage.
+- Task 5: complete (commits `5885919..25f2070`, review clean). Added the
+  bounded startup transaction state machine, versioned recovery log, bounded
+  session marker, Windows cross-process coordination, nonce-based ownership,
+  malformed/unknown-file preservation, and stale-handle regression coverage.
+  Snapshot failures remain degradable; session or recovery-log failures remain
+  startup errors. Focused recovery and snapshot tests, Clippy, formatting, and
+  diff checks passed.
