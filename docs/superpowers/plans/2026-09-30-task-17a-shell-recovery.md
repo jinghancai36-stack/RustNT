@@ -150,7 +150,7 @@ git commit -m "feat: add injected shell snapshot model"
 
 ### Task 3: Add the Windows read-only registry adapter
 
-**Files:** Modify \`crates/rustnt-gui/src/shell_snapshot.rs\`; add Windows-only tests there.
+**Files:** Modify \`Cargo.toml\` to enable \`Win32_System_Registry\`; modify \`crates/rustnt-gui/src/shell_snapshot.rs\`; add Windows-only tests there.
 
 **Interfaces:** Produce \`WindowsShellReader::new()\` implementing \`ShellValueReader\`.
 
@@ -170,11 +170,11 @@ fn windows_reader_returns_typed_results_for_both_targets() {
 
 - [ ] **Step 2: Implement the narrow wrapper**
 
-Under \`cfg(windows)\`, use only \`RegOpenKeyExW\`, \`RegQueryValueExW\`, and \`RegCloseKey\`. Open \`HKEY_LOCAL_MACHINE\` with \`KEY_QUERY_VALUE\`. Map missing values, bounded access errors, unsupported types, UTF-16 decoding errors, and embedded NULs to typed results. Do not call registry writes, process-launch APIs, \`Command\`, PowerShell, \`reg.exe\`, or Explorer APIs.
+Under \`cfg(windows)\`, use only \`RegOpenKeyExW\`, \`RegQueryValueExW\`, and \`RegCloseKey\` from the \`windows-sys\` \`Win32_System_Registry\` feature. Open \`HKEY_LOCAL_MACHINE\` with \`KEY_QUERY_VALUE\`. Map missing values, bounded access errors, unsupported types, UTF-16 decoding errors, and embedded NULs to typed results. Do not call registry writes, process-launch APIs, \`Command\`, PowerShell, \`reg.exe\`, or Explorer APIs.
 
 - [ ] **Step 3: Verify and commit**
 
-Run \`cargo test -p rustnt-gui shell_snapshot -- --nocapture\` and \`cargo clippy -p rustnt-gui --all-targets -- -D warnings\`; expected: pass. Commit with \`git commit -am "feat: read current user shell values"\`.
+Run \`cargo test -p rustnt-gui shell_snapshot -- --nocapture\` and \`cargo clippy -p rustnt-gui --all-targets -- -D warnings\`; expected: pass. Commit with \`git add Cargo.toml crates/rustnt-gui/src/shell_snapshot.rs\` followed by \`git commit -m "feat: read Winlogon shell values"\`.
 
 ---
 
