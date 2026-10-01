@@ -3,14 +3,31 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
+#[cfg(not(windows))]
+use std::sync::{MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(windows)]
+use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, HANDLE, WAIT_ABANDONED_0, WAIT_FAILED, WAIT_OBJECT_0,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 
 pub const MAX_LOG_BYTES: usize = 8 * 1024;
+pub const MAX_SESSION_BYTES: usize = 4 * 1024;
 const SESSION_FORMAT_VERSION: u32 = 1;
+const LOG_HEADER: &str = "format_version=1";
 const MAX_EVENT_BYTES: usize = 511;
+const MAX_SESSION_NONCE_BYTES: usize = 96;
 static TEMPORARY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
-static SESSION_COORDINATOR: Mutex<()> = Mutex::new(());
+#[cfg(not(windows))]
+static SESSION_COORDINATOR: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[cfg(windows)]
+const SESSION_COORDINATOR_NAME: &str = "Local\\RustNT.ShellRecovery.Session";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupState {
@@ -69,15 +86,18 @@ impl std::error::Error for RecoveryLogError {}
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct SessionFile {
-    version: u32,
+    format_version: u32,
     pid: u32,
     started_at: u64,
+    nonce: String,
     state: String,
 }
 
 impl SessionFile {
     fn is_valid(&self) -> bool {
-        self.version == SESSION_FORMAT_VERSION
+        self.format_version == SESSION_FORMAT_VERSION
+            && !self.nonce.is_empty()
+            && self.nonce.len() <= MAX_SESSION_NONCE_BYTES
             && matches!(
                 self.state.as_str(),
                 "starting"
@@ -101,6 +121,7 @@ pub struct ShellSession {
     recovery: ShellRecovery,
     pid: u32,
     started_at: u64,
+    nonce: String,
     path: PathBuf,
 }
 
@@ -198,18 +219,20 @@ impl ShellSession {
         let Some(current) = read_session_file(&self.path)? else {
             return Ok(false);
         };
-        Ok(current.version == SESSION_FORMAT_VERSION
+        Ok(current.format_version == SESSION_FORMAT_VERSION
             && current.pid == self.pid
-            && current.started_at == self.started_at)
+            && current.started_at == self.started_at
+            && current.nonce == self.nonce)
     }
 
     fn write_state_locked(&self, state: &str) -> Result<(), RecoveryLogError> {
         write_session(
             &self.path,
             &SessionFile {
-                version: SESSION_FORMAT_VERSION,
+                format_version: SESSION_FORMAT_VERSION,
                 pid: self.pid,
                 started_at: self.started_at,
+                nonce: self.nonce.clone(),
                 state: state.to_owned(),
             },
         )
@@ -253,6 +276,7 @@ pub fn begin_startup(
         recovery: recovery.clone(),
         pid,
         started_at,
+        nonce: new_session_nonce(pid),
         path: paths.shell_session_file.clone(),
     };
     session.write_state_locked("starting")?;
@@ -271,27 +295,120 @@ pub fn complete_normal_exit(session: &ShellSession) -> Result<(), RecoveryLogErr
     session.complete_normal_exit()
 }
 
-fn lock_session_coordinator() -> Result<MutexGuard<'static, ()>, RecoveryLogError> {
-    SESSION_COORDINATOR
-        .lock()
-        .map_err(|_| RecoveryLogError::new("coordinate shell session", "session lock poisoned"))
+enum SessionCoordinatorGuard {
+    #[cfg(not(windows))]
+    Process(MutexGuard<'static, ()>),
+    #[cfg(windows)]
+    Windows(HANDLE),
+}
+
+#[cfg(windows)]
+impl Drop for SessionCoordinatorGuard {
+    fn drop(&mut self) {
+        let Self::Windows(handle) = self;
+        // The guard owns the mutex after a successful wait. CloseHandle also releases the
+        // process handle; ReleaseMutex makes the ownership transition explicit first.
+        unsafe {
+            let _ = ReleaseMutex(*handle);
+            let _ = CloseHandle(*handle);
+        }
+    }
+}
+
+fn lock_session_coordinator() -> Result<SessionCoordinatorGuard, RecoveryLogError> {
+    #[cfg(not(windows))]
+    {
+        SESSION_COORDINATOR
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .map(SessionCoordinatorGuard::Process)
+            .map_err(|_| RecoveryLogError::new("coordinate shell session", "session lock poisoned"))
+    }
+
+    #[cfg(windows)]
+    {
+        let name = OsStr::new(SESSION_COORDINATOR_NAME)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+        if handle.is_null() {
+            return Err(RecoveryLogError::new(
+                "coordinate shell session",
+                format!("CreateMutexW failed with Win32 error {}", unsafe {
+                    GetLastError()
+                }),
+            ));
+        }
+        let wait_result = unsafe { WaitForSingleObject(handle, u32::MAX) };
+        if wait_result != WAIT_OBJECT_0 && wait_result != WAIT_ABANDONED_0 {
+            let error = if wait_result == WAIT_FAILED {
+                format!("WaitForSingleObject failed with Win32 error {}", unsafe {
+                    GetLastError()
+                })
+            } else {
+                format!("WaitForSingleObject returned {wait_result}")
+            };
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            return Err(RecoveryLogError::new("coordinate shell session", error));
+        }
+        Ok(SessionCoordinatorGuard::Windows(handle))
+    }
 }
 
 fn read_session_file(path: &Path) -> Result<Option<SessionFile>, RecoveryLogError> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(RecoveryLogError::new("read shell session", error)),
+    let Some(bytes) = read_bounded_file(path, MAX_SESSION_BYTES, "read shell session")? else {
+        return Ok(None);
     };
     let encoded = match String::from_utf8(bytes) {
         Ok(encoded) => encoded,
         Err(_) => return Ok(None),
     };
+    let value = match toml::from_str::<toml::Value>(&encoded) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    if let Some(version) = value
+        .get("format_version")
+        .and_then(toml::Value::as_integer)
+    {
+        if version != i64::from(SESSION_FORMAT_VERSION) {
+            return Err(RecoveryLogError::new(
+                "read shell session",
+                format!("unsupported shell session format_version {version}"),
+            ));
+        }
+    }
     let session = match toml::from_str::<SessionFile>(&encoded) {
         Ok(session) if session.is_valid() => session,
         Ok(_) | Err(_) => return Ok(None),
     };
     Ok(Some(session))
+}
+
+fn read_bounded_file(
+    path: &Path,
+    max_bytes: usize,
+    operation: &str,
+) -> Result<Option<Vec<u8>>, RecoveryLogError> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(RecoveryLogError::new(operation, error)),
+    };
+    let mut bytes = Vec::with_capacity(max_bytes + 1);
+    file.take((max_bytes + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| RecoveryLogError::new(operation, error))?;
+    if bytes.len() > max_bytes {
+        return Err(RecoveryLogError::new(
+            operation,
+            format!("persistent file exceeds {max_bytes} bytes"),
+        ));
+    }
+    Ok(Some(bytes))
 }
 
 fn append_event(
@@ -311,50 +428,136 @@ fn append_event(
         .trim_end_matches('\n')
         .to_owned()
         + "\n";
-    let existing = match std::fs::File::open(&paths.shell_recovery_log) {
-        Ok(mut file) => {
-            let mut bytes = Vec::with_capacity(MAX_LOG_BYTES + 1);
-            std::io::Read::take(std::io::Read::by_ref(&mut file), (MAX_LOG_BYTES + 1) as u64)
-                .read_to_end(&mut bytes)
-                .map_err(|error| RecoveryLogError::new("read shell recovery log", error))?;
-            bytes
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Err(RecoveryLogError::new("read shell recovery log", error)),
-    };
-    let complete_length = existing
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |index| index + 1);
-    let mut lines = existing
-        .get(..complete_length)
-        .unwrap_or_default()
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-        .map(|line| String::from_utf8_lossy(line).into_owned())
-        .collect::<Vec<_>>();
+    let mut lines = read_recovery_log(&paths.shell_recovery_log)?;
     lines.push(event.trim_end_matches('\n').to_owned());
-    let mut retained = Vec::new();
+    let mut retained_events = Vec::with_capacity(lines.len());
     let mut size = 0;
-    for line in lines.into_iter().rev() {
+    size += LOG_HEADER.len() + 1;
+    for line in lines.into_iter().skip(1).rev() {
         let line_size = line.len() + 1;
         if size + line_size > MAX_LOG_BYTES {
             break;
         }
         size += line_size;
-        retained.push(line);
+        retained_events.push(line);
     }
-    retained.reverse();
+    retained_events.reverse();
+    let mut retained = Vec::with_capacity(retained_events.len() + 1);
+    retained.push(LOG_HEADER.to_owned());
+    retained.extend(retained_events);
     let encoded = retained.join("\n") + "\n";
     write_atomic(&paths.shell_recovery_log, encoded.as_bytes())
         .map_err(|error| RecoveryLogError::new("write shell recovery log", error))
 }
 
+fn read_recovery_log(path: &Path) -> Result<Vec<String>, RecoveryLogError> {
+    let Some(bytes) = read_bounded_file(path, MAX_LOG_BYTES, "read shell recovery log")? else {
+        return Ok(vec![LOG_HEADER.to_owned()]);
+    };
+    let encoded = String::from_utf8(bytes).map_err(|_| {
+        RecoveryLogError::new(
+            "read shell recovery log",
+            "malformed recovery log: invalid UTF-8",
+        )
+    })?;
+    if !encoded.ends_with('\n') {
+        return Err(RecoveryLogError::new(
+            "read shell recovery log",
+            "malformed recovery log: incomplete final line",
+        ));
+    }
+    let mut lines = encoded
+        .strip_suffix('\n')
+        .unwrap_or_default()
+        .split('\n')
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if lines.is_empty() || lines[0] != LOG_HEADER {
+        if let Some(version) = lines.first().and_then(|line| {
+            line.strip_prefix("format_version=")
+                .and_then(|value| value.parse::<u32>().ok())
+        }) {
+            return Err(RecoveryLogError::new(
+                "read shell recovery log",
+                format!("unsupported recovery log format_version {version}"),
+            ));
+        }
+        return Err(RecoveryLogError::new(
+            "read shell recovery log",
+            "malformed recovery log: missing format_version header",
+        ));
+    }
+    if lines.iter().skip(1).any(|line| !parse_event_line(line)) {
+        return Err(RecoveryLogError::new(
+            "read shell recovery log",
+            "malformed recovery log: invalid event line",
+        ));
+    }
+    if lines.len() == 1 && encoded != format!("{LOG_HEADER}\n") {
+        return Err(RecoveryLogError::new(
+            "read shell recovery log",
+            "malformed recovery log: empty line",
+        ));
+    }
+    Ok(std::mem::take(&mut lines))
+}
+
+fn parse_event_line(line: &str) -> bool {
+    let mut fields = line.splitn(4, ' ');
+    let Some(timestamp) = fields
+        .next()
+        .and_then(|field| field.strip_prefix("timestamp="))
+    else {
+        return false;
+    };
+    let Some(pid) = fields.next().and_then(|field| field.strip_prefix("pid=")) else {
+        return false;
+    };
+    let Some(event) = fields.next().and_then(|field| field.strip_prefix("event=")) else {
+        return false;
+    };
+    let Some(result) = fields
+        .next()
+        .and_then(|field| field.strip_prefix("result="))
+    else {
+        return false;
+    };
+    timestamp.parse::<u64>().is_ok()
+        && pid.parse::<u32>().is_ok()
+        && matches!(
+            event,
+            "recovery_required"
+                | "started"
+                | "snapshot_saved"
+                | "snapshot_unavailable"
+                | "completed"
+        )
+        && !result.is_empty()
+        && !result.chars().any(char::is_control)
+}
+
 fn write_session(path: &Path, session: &SessionFile) -> Result<(), RecoveryLogError> {
     let encoded = toml::to_string(session)
         .map_err(|error| RecoveryLogError::new("serialize shell session", error))?;
+    if encoded.len() > MAX_SESSION_BYTES {
+        return Err(RecoveryLogError::new(
+            "serialize shell session",
+            format!("persistent file exceeds {MAX_SESSION_BYTES} bytes"),
+        ));
+    }
     write_atomic(path, encoded.as_bytes())
         .map_err(|error| RecoveryLogError::new("write shell session", error))
+}
+
+fn new_session_nonce(pid: u32) -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let counter = TEMPORARY_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nonce = format!("{pid:x}-{timestamp:x}-{counter:x}");
+    debug_assert!(nonce.len() <= MAX_SESSION_NONCE_BYTES);
+    nonce
 }
 
 fn write_atomic(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -501,7 +704,7 @@ mod tests {
     }
 
     fn fixture_session_toml() -> &'static str {
-        "version = 1\npid = 7\nstarted_at = 8\nstate = 'running'\n"
+        "format_version = 1\npid = 7\nstarted_at = 8\nnonce = 'fixture-nonce'\nstate = 'running'\n"
     }
 
     #[test]
@@ -566,26 +769,27 @@ mod tests {
         }
         let log = std::fs::read(&paths.shell_recovery_log).unwrap();
         assert!(log.len() <= MAX_LOG_BYTES);
+        assert!(log.starts_with(b"format_version=1\n"));
         assert!(log.ends_with(b"\n"));
         assert!(!log.contains(&b'\r'));
     }
 
     #[test]
-    fn bounded_log_discards_an_incomplete_existing_record() {
+    fn malformed_log_is_rejected_without_rewriting_existing_bytes() {
         let root = TestRoot::new("incomplete-log");
         let paths = config_paths_from_root(root.path().to_owned());
         std::fs::create_dir_all(root.path()).unwrap();
         std::fs::write(
             &paths.shell_recovery_log,
-            b"timestamp=1 pid=1 event=started result=ok\npartial-record",
+            b"format_version=1\ntimestamp=1 pid=1 event=started result=ok\npartial-record",
         )
         .unwrap();
 
-        let (_recovery, session) = ShellRecovery::begin_startup(&paths, 1, 2).unwrap();
-        let log = std::fs::read_to_string(&paths.shell_recovery_log).unwrap();
-        assert!(!log.contains("partial-record"));
-        assert!(log.lines().all(|line| !line.is_empty()));
-        session.complete_normal_exit().unwrap();
+        let original = std::fs::read(&paths.shell_recovery_log).unwrap();
+        let error = ShellRecovery::begin_startup(&paths, 1, 2)
+            .expect_err("malformed log must block startup");
+        assert!(error.message.contains("malformed"));
+        assert_eq!(std::fs::read(&paths.shell_recovery_log).unwrap(), original);
     }
 
     #[test]
@@ -598,7 +802,7 @@ mod tests {
         assert!(session.path().exists());
         assert!(std::fs::read_to_string(&paths.shell_session_file)
             .unwrap()
-            .contains("version"));
+            .contains("format_version"));
     }
 
     #[test]
@@ -616,7 +820,7 @@ mod tests {
         );
         assert!(std::fs::read_to_string(&paths.shell_session_file)
             .unwrap()
-            .contains("version"));
+            .contains("format_version"));
         let log = std::fs::read_to_string(&paths.shell_recovery_log).unwrap();
         assert!(!log.contains("event=recovery_required"));
     }
@@ -628,7 +832,7 @@ mod tests {
         std::fs::create_dir_all(root.path()).unwrap();
         std::fs::write(
             &paths.shell_session_file,
-            "version = 1\npid = 7\nstarted_at = 8\nstate = 'future_state'\n",
+            "format_version = 1\npid = 7\nstarted_at = 8\nnonce = 'fixture-nonce'\nstate = 'future_state'\n",
         )
         .unwrap();
 
@@ -667,6 +871,142 @@ mod tests {
         assert!(std::fs::read_to_string(second.path())
             .unwrap()
             .contains("pid = 3"));
+    }
+
+    #[test]
+    fn unknown_session_format_version_is_rejected_without_rewriting_bytes() {
+        let root = TestRoot::new("unknown-session-version");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let original =
+            b"format_version = 99\npid = 7\nstarted_at = 8\nnonce = 'future'\nstate = 'running'\n";
+        std::fs::create_dir_all(root.path()).unwrap();
+        std::fs::write(&paths.shell_session_file, original).unwrap();
+
+        let error = ShellRecovery::begin_startup(&paths, 3, 4)
+            .expect_err("unknown session format must block startup");
+        assert!(error.message.contains("unsupported shell session format"));
+        assert_eq!(std::fs::read(&paths.shell_session_file).unwrap(), original);
+    }
+
+    #[test]
+    fn oversized_session_is_rejected_without_rewriting_bytes() {
+        let root = TestRoot::new("oversized-session");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let original = vec![b'x'; MAX_SESSION_BYTES + 1];
+        std::fs::create_dir_all(root.path()).unwrap();
+        std::fs::write(&paths.shell_session_file, &original).unwrap();
+
+        let error = ShellRecovery::begin_startup(&paths, 3, 4)
+            .expect_err("oversized session must block startup");
+        assert!(error.message.contains("exceeds"));
+        assert_eq!(std::fs::read(&paths.shell_session_file).unwrap(), original);
+    }
+
+    #[test]
+    fn unknown_log_format_version_is_rejected_without_rewriting_bytes() {
+        let root = TestRoot::new("unknown-log-version");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let original = b"format_version=99\ntimestamp=1 pid=1 event=started result=ok\n";
+        std::fs::create_dir_all(root.path()).unwrap();
+        std::fs::write(&paths.shell_recovery_log, original).unwrap();
+
+        let error = ShellRecovery::begin_startup(&paths, 3, 4)
+            .expect_err("unknown log format must block startup");
+        assert!(error.message.contains("unsupported recovery log format"));
+        assert_eq!(std::fs::read(&paths.shell_recovery_log).unwrap(), original);
+    }
+
+    #[test]
+    fn invalid_utf8_log_is_rejected_without_rewriting_bytes() {
+        let root = TestRoot::new("invalid-utf8-log");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let original = b"format_version=1\n\xff\n";
+        std::fs::create_dir_all(root.path()).unwrap();
+        std::fs::write(&paths.shell_recovery_log, original).unwrap();
+
+        let error = ShellRecovery::begin_startup(&paths, 3, 4)
+            .expect_err("invalid UTF-8 log must block startup");
+        assert!(error.message.contains("invalid UTF-8"));
+        assert_eq!(std::fs::read(&paths.shell_recovery_log).unwrap(), original);
+    }
+
+    #[test]
+    fn same_pid_and_start_time_stale_handle_is_rejected_by_nonce() {
+        let root = TestRoot::new("same-identity-stale-session");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let (_first_recovery, first) = ShellRecovery::begin_startup(&paths, 7, 8).unwrap();
+        let (_second_recovery, second) = ShellRecovery::begin_startup(&paths, 7, 8).unwrap();
+
+        assert_ne!(first.nonce, second.nonce);
+        first.mark_running().unwrap();
+        first.complete_normal_exit().unwrap();
+
+        let current = read_session_file(&paths.shell_session_file)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.nonce, second.nonce);
+        assert_eq!(current.state, "starting");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn named_session_coordinator_is_shared_across_processes() {
+        use std::process::Command;
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let root = TestRoot::new("named-coordinator");
+        let ready = root.path().join("ready");
+        let release = root.path().join("release");
+        std::fs::create_dir_all(root.path()).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "shell_recovery::tests::hold_named_session_coordinator",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("RUSTNT_COORDINATOR_READY", &ready)
+            .env("RUSTNT_COORDINATOR_RELEASE", &release)
+            .spawn()
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "child did not acquire named coordinator");
+
+        let (acquired, wait_for_acquire) = mpsc::channel();
+        let release_for_waiter = release.clone();
+        let waiter = thread::spawn(move || {
+            let guard = lock_session_coordinator().unwrap();
+            acquired.send(()).unwrap();
+            while !release_for_waiter.exists() {
+                thread::sleep(Duration::from_millis(10));
+            }
+            drop(guard);
+        });
+        thread::sleep(Duration::from_millis(100));
+        assert!(wait_for_acquire.try_recv().is_err());
+        std::fs::write(&release, b"release").unwrap();
+        waiter.join().unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hold_named_session_coordinator() {
+        let Some(ready) = std::env::var_os("RUSTNT_COORDINATOR_READY") else {
+            return;
+        };
+        let release = PathBuf::from(std::env::var_os("RUSTNT_COORDINATOR_RELEASE").unwrap());
+        let _guard = lock_session_coordinator().unwrap();
+        std::fs::write(ready, b"ready").unwrap();
+        while !release.exists() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]

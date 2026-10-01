@@ -1,5 +1,5 @@
 use std::fmt;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,6 +10,7 @@ use crate::config::ConfigPaths;
 
 pub const FORMAT_VERSION: u32 = 1;
 pub const MAX_VALUE_BYTES: usize = 4096;
+pub const MAX_SNAPSHOT_BYTES: usize = 16 * 1024;
 
 static TEMPORARY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -316,6 +317,12 @@ pub fn save_snapshot(paths: &ConfigPaths, snapshot: &ShellSnapshot) -> Result<()
         .map_err(|error| SnapshotError::new("create snapshot directory", error))?;
     let encoded = toml::to_string_pretty(snapshot)
         .map_err(|error| SnapshotError::new("serialize snapshot", error))?;
+    if encoded.len() > MAX_SNAPSHOT_BYTES {
+        return Err(SnapshotError::new(
+            "serialize snapshot",
+            format!("persistent file exceeds {MAX_SNAPSHOT_BYTES} bytes"),
+        ));
+    }
     let temporary = write_temporary_snapshot(&paths.shell_snapshot_file, &encoded)
         .map_err(|error| SnapshotError::new("write temporary snapshot", error))?;
     if let Err(error) = replace_snapshot_file(&temporary, &paths.shell_snapshot_file) {
@@ -326,11 +333,11 @@ pub fn save_snapshot(paths: &ConfigPaths, snapshot: &ShellSnapshot) -> Result<()
 }
 
 pub fn load_snapshot(paths: &ConfigPaths) -> Result<Option<ShellSnapshot>, SnapshotError> {
-    let encoded = match std::fs::read_to_string(&paths.shell_snapshot_file) {
-        Ok(encoded) => encoded,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(SnapshotError::new("read snapshot", error)),
+    let Some(bytes) = read_bounded_snapshot(&paths.shell_snapshot_file)? else {
+        return Ok(None);
     };
+    let encoded = String::from_utf8(bytes)
+        .map_err(|error| SnapshotError::new("read snapshot", format!("invalid UTF-8: {error}")))?;
     let value = toml::from_str::<toml::Value>(&encoded).map_err(|error| {
         SnapshotError::new("load snapshot", format!("invalid snapshot: {error}"))
     })?;
@@ -350,6 +357,25 @@ pub fn load_snapshot(paths: &ConfigPaths) -> Result<Option<ShellSnapshot>, Snaps
     toml::from_str(&encoded)
         .map(Some)
         .map_err(|error| SnapshotError::new("load snapshot", format!("invalid snapshot: {error}")))
+}
+
+fn read_bounded_snapshot(path: &Path) -> Result<Option<Vec<u8>>, SnapshotError> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(SnapshotError::new("read snapshot", error)),
+    };
+    let mut bytes = Vec::with_capacity(MAX_SNAPSHOT_BYTES + 1);
+    file.take((MAX_SNAPSHOT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| SnapshotError::new("read snapshot", error))?;
+    if bytes.len() > MAX_SNAPSHOT_BYTES {
+        return Err(SnapshotError::new(
+            "read snapshot",
+            format!("persistent file exceeds {MAX_SNAPSHOT_BYTES} bytes"),
+        ));
+    }
+    Ok(Some(bytes))
 }
 
 fn temporary_snapshot_path(target: &Path) -> PathBuf {
@@ -731,6 +757,46 @@ mod tests {
         let error = load_snapshot(&paths).expect_err("unknown version must fail");
         assert!(error.message.contains("unsupported snapshot format"));
         assert_eq!(std::fs::read(&paths.shell_snapshot_file).unwrap(), original);
+    }
+
+    #[test]
+    fn oversized_snapshot_is_rejected_without_deleting_file() {
+        let root = TestRoot::new("oversized-load");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let original = vec![b'x'; MAX_SNAPSHOT_BYTES + 1];
+        std::fs::create_dir_all(root.path()).unwrap();
+        std::fs::write(&paths.shell_snapshot_file, &original).unwrap();
+
+        let error = load_snapshot(&paths).expect_err("oversized snapshot must fail");
+        assert!(error.message.contains("exceeds"));
+        assert_eq!(std::fs::read(&paths.shell_snapshot_file).unwrap(), original);
+    }
+
+    #[test]
+    fn oversized_serialized_snapshot_is_rejected_before_replacement() {
+        let root = TestRoot::new("oversized-save");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let mut snapshot = fixture_snapshot();
+        snapshot.entries = (0..512)
+            .map(|index| ShellValueSnapshot {
+                target: if index % 2 == 0 {
+                    ShellValueTarget::Shell
+                } else {
+                    ShellValueTarget::Userinit
+                },
+                value_type: Some(RegistryValueType::Other(index)),
+                result: SnapshotResult::Failed {
+                    category: "bounded-error".to_owned(),
+                    win32_code: Some(index),
+                },
+                character_count: 0,
+                digest: "x".repeat(128),
+            })
+            .collect();
+
+        let error = save_snapshot(&paths, &snapshot).expect_err("oversized snapshot must fail");
+        assert!(error.message.contains("exceeds"));
+        assert!(!paths.shell_snapshot_file.exists());
     }
 
     #[test]
