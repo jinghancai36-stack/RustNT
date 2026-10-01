@@ -1,15 +1,25 @@
-use serde::Serialize;
+use std::fmt;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+
+use crate::config::ConfigPaths;
 
 pub const FORMAT_VERSION: u32 = 1;
 pub const MAX_VALUE_BYTES: usize = 4096;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+static TEMPORARY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ShellValueTarget {
     Shell,
     Userinit,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum RegistryValueType {
     String,
     ExpandString,
@@ -251,7 +261,7 @@ impl Drop for RegistryKey {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum SnapshotResult {
     Present,
     Missing,
@@ -261,7 +271,7 @@ pub enum SnapshotResult {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ShellValueSnapshot {
     pub target: ShellValueTarget,
     pub value_type: Option<RegistryValueType>,
@@ -270,12 +280,167 @@ pub struct ShellValueSnapshot {
     pub digest: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ShellSnapshot {
     pub format_version: u32,
     pub captured_at_unix_seconds: u64,
     pub process_id: u32,
     pub entries: Vec<ShellValueSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotError {
+    pub operation: String,
+    pub message: String,
+}
+
+impl SnapshotError {
+    fn new(operation: impl Into<String>, error: impl fmt::Display) -> Self {
+        Self {
+            operation: operation.into(),
+            message: error.to_string(),
+        }
+    }
+}
+
+impl fmt::Display for SnapshotError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.operation, self.message)
+    }
+}
+
+impl std::error::Error for SnapshotError {}
+
+pub fn save_snapshot(paths: &ConfigPaths, snapshot: &ShellSnapshot) -> Result<(), SnapshotError> {
+    std::fs::create_dir_all(&paths.root)
+        .map_err(|error| SnapshotError::new("create snapshot directory", error))?;
+    let encoded = toml::to_string_pretty(snapshot)
+        .map_err(|error| SnapshotError::new("serialize snapshot", error))?;
+    let temporary = write_temporary_snapshot(&paths.shell_snapshot_file, &encoded)
+        .map_err(|error| SnapshotError::new("write temporary snapshot", error))?;
+    if let Err(error) = replace_snapshot_file(&temporary, &paths.shell_snapshot_file) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(SnapshotError::new("replace snapshot", error));
+    }
+    Ok(())
+}
+
+pub fn load_snapshot(paths: &ConfigPaths) -> Result<Option<ShellSnapshot>, SnapshotError> {
+    let encoded = match std::fs::read_to_string(&paths.shell_snapshot_file) {
+        Ok(encoded) => encoded,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(SnapshotError::new("read snapshot", error)),
+    };
+    let value = toml::from_str::<toml::Value>(&encoded).map_err(|error| {
+        SnapshotError::new("load snapshot", format!("invalid snapshot: {error}"))
+    })?;
+    let version = value
+        .get("format_version")
+        .and_then(toml::Value::as_integer)
+        .and_then(|version| u32::try_from(version).ok())
+        .ok_or_else(|| {
+            SnapshotError::new("load snapshot", "invalid snapshot: missing format_version")
+        })?;
+    if version != FORMAT_VERSION {
+        return Err(SnapshotError::new(
+            "load snapshot",
+            format!("unsupported snapshot format: version {version}"),
+        ));
+    }
+    toml::from_str(&encoded)
+        .map(Some)
+        .map_err(|error| SnapshotError::new("load snapshot", format!("invalid snapshot: {error}")))
+}
+
+fn temporary_snapshot_path(target: &Path) -> PathBuf {
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    let name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("shell_snapshot.toml");
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let counter = TEMPORARY_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(
+        "{name}.{}.{}.{}.tmp",
+        std::process::id(),
+        timestamp,
+        counter
+    ))
+}
+
+fn write_temporary_snapshot(target: &Path, encoded: &str) -> std::io::Result<PathBuf> {
+    for _ in 0..16 {
+        let temporary = temporary_snapshot_path(target);
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        if let Err(error) = file.write_all(encoded.as_bytes()) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+        return Ok(temporary);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique temporary snapshot path",
+    ))
+}
+
+#[cfg(not(windows))]
+fn replace_snapshot_file(temporary: &Path, target: &Path) -> std::io::Result<()> {
+    std::fs::rename(temporary, target)
+}
+
+#[cfg(windows)]
+fn replace_snapshot_file(temporary: &Path, target: &Path) -> std::io::Result<()> {
+    if !target.exists() {
+        return match std::fs::rename(temporary, target) {
+            Ok(()) => Ok(()),
+            Err(_error) if target.exists() => replace_existing_snapshot(temporary, target),
+            Err(error) => Err(error),
+        };
+    }
+    replace_existing_snapshot(temporary, target)
+}
+
+#[cfg(windows)]
+fn replace_existing_snapshot(temporary: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let target_wide = target
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let temporary_wide = temporary
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let replaced = unsafe {
+        windows_sys::Win32::Storage::FileSystem::ReplaceFileW(
+            target_wide.as_ptr(),
+            temporary_wide.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if replaced == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 pub fn collect_snapshot(
@@ -384,6 +549,9 @@ fn sanitized_character_count(value: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::config_paths_from_root;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[cfg(windows)]
     #[test]
@@ -441,6 +609,127 @@ mod tests {
                 ShellValueTarget::Userinit => self.userinit.clone(),
             }
         }
+    }
+
+    struct TestRoot(PathBuf);
+
+    impl TestRoot {
+        fn new(name: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            Self(std::env::temp_dir().join(format!("rustnt-gui-shell-snapshot-{name}-{unique}")))
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fixture_snapshot() -> ShellSnapshot {
+        ShellSnapshot {
+            format_version: FORMAT_VERSION,
+            captured_at_unix_seconds: 1_700_000_000,
+            process_id: 1234,
+            entries: vec![
+                ShellValueSnapshot {
+                    target: ShellValueTarget::Shell,
+                    value_type: Some(RegistryValueType::String),
+                    result: SnapshotResult::Present,
+                    character_count: 12,
+                    digest: "fnv1a64:0123456789abcdef".to_owned(),
+                },
+                ShellValueSnapshot {
+                    target: ShellValueTarget::Userinit,
+                    value_type: Some(RegistryValueType::ExpandString),
+                    result: SnapshotResult::Missing,
+                    character_count: 0,
+                    digest: String::new(),
+                },
+            ],
+        }
+    }
+
+    fn assert_no_temporary_snapshots(paths: &crate::config::ConfigPaths) {
+        let entries = std::fs::read_dir(&paths.root).unwrap();
+        assert!(entries.filter_map(Result::ok).all(|entry| {
+            !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("shell_snapshot.toml.")
+                || !entry.file_name().to_string_lossy().ends_with(".tmp")
+        }));
+    }
+
+    #[test]
+    fn save_and_load_snapshot_round_trip_without_raw_values() {
+        let root = TestRoot::new("round-trip");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let snapshot = fixture_snapshot();
+        save_snapshot(&paths, &snapshot).unwrap();
+        assert_eq!(load_snapshot(&paths).unwrap().unwrap(), snapshot);
+        let encoded = std::fs::read_to_string(&paths.shell_snapshot_file).unwrap();
+        assert!(!encoded.contains("explorer.exe"));
+        assert_no_temporary_snapshots(&paths);
+    }
+
+    #[test]
+    fn saving_snapshot_twice_replaces_existing_file_and_cleans_temporary_file() {
+        let root = TestRoot::new("overwrite");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let first = fixture_snapshot();
+        let mut second = fixture_snapshot();
+        second.process_id = 5678;
+
+        save_snapshot(&paths, &first).unwrap();
+        save_snapshot(&paths, &second).unwrap();
+
+        assert_eq!(load_snapshot(&paths).unwrap().unwrap(), second);
+        assert_no_temporary_snapshots(&paths);
+    }
+
+    #[test]
+    fn missing_snapshot_returns_none_without_creating_directory() {
+        let root = TestRoot::new("missing");
+        let paths = config_paths_from_root(root.path().to_owned());
+
+        assert_eq!(load_snapshot(&paths).unwrap(), None);
+        assert!(!root.path().exists());
+    }
+
+    #[test]
+    fn malformed_snapshot_is_reported_without_deleting_file() {
+        let root = TestRoot::new("malformed");
+        let paths = config_paths_from_root(root.path().to_owned());
+        std::fs::create_dir_all(root.path()).unwrap();
+        let original = "this is not valid toml =";
+        std::fs::write(&paths.shell_snapshot_file, original).unwrap();
+
+        let error = load_snapshot(&paths).expect_err("malformed snapshot must fail");
+        assert!(error.message.contains("invalid snapshot"));
+        assert_eq!(
+            std::fs::read_to_string(&paths.shell_snapshot_file).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn unknown_snapshot_version_is_reported_without_deleting_file() {
+        let root = TestRoot::new("version");
+        let paths = config_paths_from_root(root.path().to_owned());
+        std::fs::create_dir_all(root.path()).unwrap();
+        std::fs::write(&paths.shell_snapshot_file, "format_version = 99\n").unwrap();
+
+        let error = load_snapshot(&paths).expect_err("unknown version must fail");
+        assert!(error.message.contains("unsupported snapshot format"));
+        assert!(paths.shell_snapshot_file.exists());
     }
 
     #[test]
