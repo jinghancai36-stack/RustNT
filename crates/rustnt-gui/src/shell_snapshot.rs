@@ -61,8 +61,6 @@ pub struct ShellValueSnapshot {
     pub result: SnapshotResult,
     pub character_count: usize,
     pub digest: String,
-    #[serde(skip)]
-    pub display_value: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -99,7 +97,6 @@ fn snapshot_value(reader: &impl ShellValueReader, target: ShellValueTarget) -> S
             result: SnapshotResult::Missing,
             character_count: 0,
             digest: String::new(),
-            display_value: None,
         },
         Ok(RegistryRead::Present { value_type, value }) => {
             let digest = fnv1a64_digest(&value);
@@ -113,18 +110,15 @@ fn snapshot_value(reader: &impl ShellValueReader, target: ShellValueTarget) -> S
                     },
                     character_count: 0,
                     digest,
-                    display_value: None,
                 };
             }
 
-            let display_value = sanitize_and_bound(&value);
             ShellValueSnapshot {
                 target,
                 value_type: Some(value_type),
                 result: SnapshotResult::Present,
-                character_count: display_value.chars().count(),
+                character_count: sanitized_character_count(&value),
                 digest,
-                display_value: Some(display_value),
             }
         }
         Err(error) => ShellValueSnapshot {
@@ -136,7 +130,6 @@ fn snapshot_value(reader: &impl ShellValueReader, target: ShellValueTarget) -> S
             },
             character_count: 0,
             digest: String::new(),
-            display_value: None,
         },
     }
 }
@@ -150,20 +143,22 @@ fn fnv1a64_digest(value: &str) -> String {
     format!("fnv1a64:{hash:016x}")
 }
 
-fn sanitize_and_bound(value: &str) -> String {
-    let mut sanitized = String::with_capacity(MAX_VALUE_BYTES.min(value.len()));
+fn sanitized_character_count(value: &str) -> usize {
+    let mut byte_count = 0;
+    let mut character_count = 0;
     for character in value.chars() {
         let character = if character.is_control() {
             ' '
         } else {
             character
         };
-        if sanitized.len() + character.len_utf8() > MAX_VALUE_BYTES {
+        if byte_count + character.len_utf8() > MAX_VALUE_BYTES {
             break;
         }
-        sanitized.push(character);
+        byte_count += character.len_utf8();
+        character_count += 1;
     }
-    sanitized
+    character_count
 }
 
 #[cfg(test)]
@@ -226,7 +221,15 @@ mod tests {
         assert_eq!(snapshot.entries.len(), 2);
         assert_eq!(snapshot.entries[0].target, ShellValueTarget::Shell);
         assert!(snapshot.entries[0].digest.starts_with("fnv1a64:"));
-        assert!(snapshot.entries[0].display_value.is_none());
+        assert_eq!(
+            snapshot.entries[0].result,
+            SnapshotResult::Failed {
+                category: "embedded_nul".to_owned(),
+                win32_code: None,
+            }
+        );
+        assert!(!format!("{snapshot:?}").contains("explorer.exe"));
+        assert!(!format!("{snapshot:?}").contains("userinit.exe"));
     }
 
     #[test]
@@ -244,5 +247,21 @@ mod tests {
                 win32_code: Some(5),
             }
         );
+    }
+
+    #[test]
+    fn collect_snapshot_sanitizes_controls_and_bounds_metadata() {
+        let value = format!("prefix\t\r\n{}", "x".repeat(MAX_VALUE_BYTES));
+        let reader =
+            FixtureReader::with_values(Some((RegistryValueType::String, value.as_str())), None);
+
+        let snapshot = collect_snapshot(&reader, 10, 20);
+        let entry = &snapshot.entries[0];
+
+        assert_eq!(entry.result, SnapshotResult::Present);
+        assert!(entry.character_count <= MAX_VALUE_BYTES);
+        assert!(!format!("{snapshot:?}").contains('\t'));
+        assert!(!format!("{snapshot:?}").contains('\r'));
+        assert!(!format!("{snapshot:?}").contains('\n'));
     }
 }
