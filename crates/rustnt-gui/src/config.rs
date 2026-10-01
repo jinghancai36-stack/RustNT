@@ -566,8 +566,14 @@ mod tests {
         assert_eq!(paths.config_file, root.path().join("gui.toml"));
         assert_eq!(paths.marker_file, root.path().join("gui.running"));
         assert_eq!(paths.crash_log, root.path().join("gui-crash.log"));
-        assert_eq!(paths.shell_snapshot_file, root.path().join("shell_snapshot.toml"));
-        assert_eq!(paths.shell_recovery_log, root.path().join("shell_recovery.log"));
+        assert_eq!(
+            paths.shell_snapshot_file,
+            root.path().join("shell_snapshot.toml")
+        );
+        assert_eq!(
+            paths.shell_recovery_log,
+            root.path().join("shell_recovery.log")
+        );
         assert_eq!(paths.shell_session_file, root.path().join("shell.session"));
         assert!(!root.path().exists());
     }
