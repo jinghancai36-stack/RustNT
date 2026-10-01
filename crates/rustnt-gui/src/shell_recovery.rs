@@ -3,13 +3,14 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MAX_LOG_BYTES: usize = 8 * 1024;
 const SESSION_FORMAT_VERSION: u32 = 1;
 const MAX_EVENT_BYTES: usize = 511;
 static TEMPORARY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+static SESSION_COORDINATOR: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupState {
@@ -74,6 +75,21 @@ struct SessionFile {
     state: String,
 }
 
+impl SessionFile {
+    fn is_valid(&self) -> bool {
+        self.version == SESSION_FORMAT_VERSION
+            && matches!(
+                self.state.as_str(),
+                "starting"
+                    | "running"
+                    | "recovery_required"
+                    | "recovery_recorded"
+                    | "snapshot_unavailable"
+                    | "completed"
+            )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ShellRecovery {
     paths: ConfigPaths,
@@ -120,7 +136,11 @@ impl ShellSession {
     }
 
     pub fn mark_running(&self) -> Result<(), RecoveryLogError> {
-        self.write_state("running")?;
+        let _coordinator = lock_session_coordinator()?;
+        if !self.owns_current_session_locked()? {
+            return Ok(());
+        }
+        self.write_state_locked("running")?;
         self.set_state(StartupState::Running)
     }
 
@@ -128,6 +148,10 @@ impl ShellSession {
         &self,
         result: Result<(), String>,
     ) -> Result<(), RecoveryLogError> {
+        let _coordinator = lock_session_coordinator()?;
+        if !self.owns_current_session_locked()? {
+            return Ok(());
+        }
         match result {
             Ok(()) => append_event(
                 &self.recovery.paths,
@@ -143,7 +167,7 @@ impl ShellSession {
                     RecoveryEventKind::SnapshotUnavailable,
                     &summary,
                 )?;
-                self.write_state("snapshot_unavailable")?;
+                self.write_state_locked("snapshot_unavailable")?;
                 self.set_state(StartupState::SnapshotUnavailable)?;
             }
         }
@@ -151,7 +175,8 @@ impl ShellSession {
     }
 
     pub fn complete_normal_exit(&self) -> Result<(), RecoveryLogError> {
-        if !self.owns_current_session()? {
+        let _coordinator = lock_session_coordinator()?;
+        if !self.owns_current_session_locked()? {
             return Ok(());
         }
         append_event(
@@ -160,7 +185,7 @@ impl ShellSession {
             RecoveryEventKind::Completed,
             "ok",
         )?;
-        self.write_state("completed")?;
+        self.write_state_locked("completed")?;
         match std::fs::remove_file(&self.path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -169,22 +194,16 @@ impl ShellSession {
         self.set_state(StartupState::Completed)
     }
 
-    fn owns_current_session(&self) -> Result<bool, RecoveryLogError> {
-        let encoded = match std::fs::read_to_string(&self.path) {
-            Ok(encoded) => encoded,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(RecoveryLogError::new("read shell session", error)),
-        };
-        let current: SessionFile = match toml::from_str(&encoded) {
-            Ok(current) => current,
-            Err(_) => return Ok(false),
+    fn owns_current_session_locked(&self) -> Result<bool, RecoveryLogError> {
+        let Some(current) = read_session_file(&self.path)? else {
+            return Ok(false);
         };
         Ok(current.version == SESSION_FORMAT_VERSION
             && current.pid == self.pid
             && current.started_at == self.started_at)
     }
 
-    fn write_state(&self, state: &str) -> Result<(), RecoveryLogError> {
+    fn write_state_locked(&self, state: &str) -> Result<(), RecoveryLogError> {
         write_session(
             &self.path,
             &SessionFile {
@@ -209,14 +228,11 @@ pub fn begin_startup(
     std::fs::create_dir_all(&paths.root)
         .map_err(|error| RecoveryLogError::new("create shell recovery directory", error))?;
 
-    let previous = match std::fs::read_to_string(&paths.shell_session_file) {
-        Ok(encoded) => toml::from_str::<SessionFile>(&encoded).ok(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(RecoveryLogError::new("read shell session", error)),
-    };
-    let recovered = previous.as_ref().is_some_and(|session| {
-        session.version == SESSION_FORMAT_VERSION && session.state != "completed"
-    });
+    let _coordinator = lock_session_coordinator()?;
+    let previous = read_session_file(&paths.shell_session_file)?;
+    let recovered = previous
+        .as_ref()
+        .is_some_and(|session| session.state != "completed");
 
     let recovery = ShellRecovery {
         paths: paths.clone(),
@@ -239,7 +255,7 @@ pub fn begin_startup(
         started_at,
         path: paths.shell_session_file.clone(),
     };
-    session.write_state("starting")?;
+    session.write_state_locked("starting")?;
     append_event(paths, pid, RecoveryEventKind::Started, "ok")?;
     Ok((recovery, session))
 }
@@ -253,6 +269,29 @@ pub fn record_snapshot_result(
 
 pub fn complete_normal_exit(session: &ShellSession) -> Result<(), RecoveryLogError> {
     session.complete_normal_exit()
+}
+
+fn lock_session_coordinator() -> Result<MutexGuard<'static, ()>, RecoveryLogError> {
+    SESSION_COORDINATOR
+        .lock()
+        .map_err(|_| RecoveryLogError::new("coordinate shell session", "session lock poisoned"))
+}
+
+fn read_session_file(path: &Path) -> Result<Option<SessionFile>, RecoveryLogError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(RecoveryLogError::new("read shell session", error)),
+    };
+    let encoded = match String::from_utf8(bytes) {
+        Ok(encoded) => encoded,
+        Err(_) => return Ok(None),
+    };
+    let session = match toml::from_str::<SessionFile>(&encoded) {
+        Ok(session) if session.is_valid() => session,
+        Ok(_) | Err(_) => return Ok(None),
+    };
+    Ok(Some(session))
 }
 
 fn append_event(
@@ -563,6 +602,43 @@ mod tests {
     }
 
     #[test]
+    fn invalid_utf8_old_session_is_treated_as_malformed() {
+        let root = TestRoot::new("invalid-utf8-session");
+        let paths = config_paths_from_root(root.path().to_owned());
+        std::fs::create_dir_all(root.path()).unwrap();
+        std::fs::write(&paths.shell_session_file, [0xff, 0xfe, 0x00]).unwrap();
+
+        let (_recovery, session) = ShellRecovery::begin_startup(&paths, 3, 4).unwrap();
+        assert!(session.path().exists());
+        assert_ne!(
+            std::fs::read(&paths.shell_session_file).unwrap(),
+            [0xff, 0xfe, 0x00]
+        );
+        assert!(std::fs::read_to_string(&paths.shell_session_file)
+            .unwrap()
+            .contains("version"));
+        let log = std::fs::read_to_string(&paths.shell_recovery_log).unwrap();
+        assert!(!log.contains("event=recovery_required"));
+    }
+
+    #[test]
+    fn unknown_session_state_is_treated_as_malformed() {
+        let root = TestRoot::new("unknown-session-state");
+        let paths = config_paths_from_root(root.path().to_owned());
+        std::fs::create_dir_all(root.path()).unwrap();
+        std::fs::write(
+            &paths.shell_session_file,
+            "version = 1\npid = 7\nstarted_at = 8\nstate = 'future_state'\n",
+        )
+        .unwrap();
+
+        let (recovery, _session) = ShellRecovery::begin_startup(&paths, 3, 4).unwrap();
+        assert_eq!(recovery.startup_state(), StartupState::Starting);
+        let log = std::fs::read_to_string(&paths.shell_recovery_log).unwrap();
+        assert!(!log.contains("event=recovery_required"));
+    }
+
+    #[test]
     fn session_write_failure_is_returned() {
         let root = TestRoot::new("session-write-failure");
         std::fs::create_dir_all(root.path()).unwrap();
@@ -591,5 +667,20 @@ mod tests {
         assert!(std::fs::read_to_string(second.path())
             .unwrap()
             .contains("pid = 3"));
+    }
+
+    #[test]
+    fn stale_session_handle_does_not_change_newer_session_to_running() {
+        let root = TestRoot::new("stale-running-session");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let (_first_recovery, first) = ShellRecovery::begin_startup(&paths, 1, 2).unwrap();
+        let (_second_recovery, second) = ShellRecovery::begin_startup(&paths, 3, 4).unwrap();
+
+        first.mark_running().unwrap();
+
+        let current = std::fs::read_to_string(second.path()).unwrap();
+        assert!(current.contains("pid = 3"));
+        assert!(current.contains("started_at = 4"));
+        assert!(current.contains("state = \"starting\""));
     }
 }
