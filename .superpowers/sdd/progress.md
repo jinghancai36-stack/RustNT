@@ -142,3 +142,9 @@ produce typed audit events. Rate-limited events omit the unvalidated requested P
 - Task 2: complete (commit 628f423, review clean). Routed the third GUI page to File Manager and integrated read-only path navigation, direct-child metadata display, filtering, sorting, refresh/history controls, error retention, and one-notification-per-failed-action behavior. Workspace Clippy test lints were corrected in `9906070`.
 - Task 3: complete (verification clean). Confirmed the read-only scope, preserved Task14/Task15 behavior, passed formatting, GUI tests, workspace check/build/Clippy, 205 serial workspace tests, and diff checks. Full details are in `.superpowers/sdd/task-16-report.md`.
 - Task16 is complete at implementation commit `628f423` plus fixes `57ce351`, `9906070`, `97af6ae`, and the Task3 verification documentation commit.
+
+## Task 17A Shell Snapshot and Recovery Foundation
+
+- Task 1: complete (commit `c83a3da`, review clean). Added deterministic
+  `ConfigPaths` entries for the Task17A snapshot, recovery log, and session
+  files without changing existing GUI configuration paths or serialization.
