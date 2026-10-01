@@ -152,7 +152,7 @@ Task17A 只读读取系统 Winlogon Shell 配置。标准 Windows Winlogon 配�
 
 ## 8. 验收标准
 
-1. Task17A 只读取当前用户 Shell 配置，不修改 Windows Shell 或注册表。
+1. Task17A 只读取 HKLM Winlogon Shell 配置，不修改 Windows Shell 或注册表。
 2. 快照、事务标记和恢复日志只写入 `%APPDATA%\\RustNT`。
 3. 发生快照读取或保存错误时，GUI 仍能启动并保留可见错误结果；恢复日志或事务标记不可用时拒绝启动。
 4. 异常终止可由下一次启动识别，正常退出可以完成事务清理。
