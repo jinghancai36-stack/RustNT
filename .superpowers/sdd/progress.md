@@ -148,3 +148,7 @@ produce typed audit events. Rate-limited events omit the unvalidated requested P
 - Task 1: complete (commit `c83a3da`, review clean). Added deterministic
   `ConfigPaths` entries for the Task17A snapshot, recovery log, and session
   files without changing existing GUI configuration paths or serialization.
+- Task 2: complete (commits `d1795e7..793c0fb`, review clean). Added the
+  injected, platform-neutral Shell snapshot model with deterministic Winlogon
+  targets, bounded metadata, digesting, control sanitization, embedded-NUL and
+  oversized-input rejection, plus metadata-only TOML serialization coverage.
