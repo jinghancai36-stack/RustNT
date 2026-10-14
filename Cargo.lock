@@ -2654,6 +2654,7 @@ name = "rustnt-shell-switch"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "toml",
 ]
 
 [[package]]
