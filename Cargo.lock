@@ -2650,6 +2650,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustnt-shell-switch"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "rustnt-task09-target"
 version = "0.1.0"
 
