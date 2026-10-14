@@ -46,6 +46,7 @@ impl TransactionState {
                 | (BackedUp, Failed)
                 | (ShellWritten, Failed)
                 | (ReadBackVerified, Failed)
+                | (Failed, RestoreRequested)
         )
     }
 }
@@ -207,6 +208,7 @@ mod tests {
             (BackedUp, Failed),
             (ShellWritten, Failed),
             (ReadBackVerified, Failed),
+            (Failed, RestoreRequested),
         ];
         let states = [
             Prepared,
@@ -231,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_state_requires_recovery_validation_before_restore_request() {
-        assert!(!TransactionState::Failed.can_transition_to(TransactionState::RestoreRequested));
+    fn failed_state_can_enter_recovery_after_coordinator_validation() {
+        assert!(TransactionState::Failed.can_transition_to(TransactionState::RestoreRequested));
     }
 }
