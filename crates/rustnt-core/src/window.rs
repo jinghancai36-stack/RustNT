@@ -17,7 +17,7 @@ use windows_sys::Win32::System::StationsAndDesktops::{
 use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, SetForegroundWindow,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -562,11 +562,115 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>, WindowError> {
     Ok(sessions)
 }
 
+/// Result of a foreground activation attempt.
+///
+/// Windows foreground activation is policy controlled: a background process can
+/// call `SetForegroundWindow` successfully and still not receive the foreground.
+/// Callers must treat `AcceptedButNotForeground` and `Rejected` as environment
+/// limitations, not as reasons to bypass the policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationOutcome {
+    Activated,
+    AcceptedButNotForeground,
+    Rejected { code: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationRejection {
+    InvalidWindow,
+    OwnProcess,
+}
+
+/// Pure activation gate: rejects invalid handles and RustNT's own windows
+/// before any Win32 call is made.
+pub fn activation_precheck(
+    is_window: bool,
+    target_pid: u32,
+    self_pid: u32,
+) -> Option<ActivationRejection> {
+    if !is_window {
+        return Some(ActivationRejection::InvalidWindow);
+    }
+    if target_pid == self_pid {
+        return Some(ActivationRejection::OwnProcess);
+    }
+    None
+}
+
+/// Requests the foreground for one window.
+///
+/// Only `SetForegroundWindow` is used. No `AttachThreadInput`, synthetic input,
+/// elevation, or other focus-bypass technique is performed.
+pub fn activate_window(hwnd: usize) -> Result<ActivationOutcome, WindowError> {
+    if hwnd == 0 {
+        return Err(WindowError::InvalidData(
+            "window handle must not be null".to_owned(),
+        ));
+    }
+
+    let is_window = unsafe {
+        // SAFETY: IsWindow accepts any handle value and only reports validity.
+        IsWindow(hwnd as HWND)
+    } != 0;
+    let mut target_pid = 0u32;
+    if is_window {
+        unsafe {
+            // SAFETY: the handle was reported as a valid window; the pid out-pointer is writable.
+            GetWindowThreadProcessId(hwnd as HWND, &mut target_pid);
+        }
+    }
+    let self_pid = unsafe {
+        // SAFETY: GetCurrentProcessId has no preconditions.
+        GetCurrentProcessId()
+    };
+
+    match activation_precheck(is_window, target_pid, self_pid) {
+        Some(ActivationRejection::InvalidWindow) => {
+            return Err(WindowError::InvalidData(format!(
+                "window handle {} is not a valid window",
+                format_hwnd(hwnd)
+            )))
+        }
+        Some(ActivationRejection::OwnProcess) => {
+            return Err(WindowError::InvalidData(
+                "refusing to activate a RustNT window".to_owned(),
+            ))
+        }
+        None => {}
+    }
+
+    unsafe {
+        // SAFETY: the handle is a valid top-level window owned by another process.
+        SetLastError(0);
+    }
+    let accepted = unsafe {
+        // SAFETY: see above; SetForegroundWindow only requests the foreground.
+        SetForegroundWindow(hwnd as HWND)
+    } != 0;
+    let foreground = unsafe {
+        // SAFETY: GetForegroundWindow has no preconditions.
+        GetForegroundWindow() as usize
+    };
+    let code = unsafe {
+        // SAFETY: GetLastError reads the thread-local error of this thread.
+        GetLastError()
+    };
+
+    if foreground == hwnd {
+        Ok(ActivationOutcome::Activated)
+    } else if accepted {
+        Ok(ActivationOutcome::AcceptedButNotForeground)
+    } else {
+        Ok(ActivationOutcome::Rejected { code })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        enumerate_windows, foreground_window, format_hwnd, list_sessions, map_session_state,
-        optional_text, wide_string, wide_string_from_ptr, SessionState,
+        activation_precheck, enumerate_windows, foreground_window, format_hwnd, list_sessions,
+        map_session_state, optional_text, wide_string, wide_string_from_ptr, ActivationRejection,
+        SessionState,
     };
 
     #[test]
@@ -706,5 +810,18 @@ mod tests {
             assert!(window.hwnd != 0);
             assert!(window.session_id > 0);
         }
+    }
+
+    #[test]
+    fn activation_precheck_rejects_invalid_handles_and_own_windows() {
+        assert_eq!(
+            activation_precheck(false, 7, 42),
+            Some(ActivationRejection::InvalidWindow)
+        );
+        assert_eq!(
+            activation_precheck(true, 42, 42),
+            Some(ActivationRejection::OwnProcess)
+        );
+        assert_eq!(activation_precheck(true, 7, 42), None);
     }
 }
