@@ -86,6 +86,22 @@ pub const POLLING_STALL_TIMEOUT: Duration = Duration::from_secs(6);
 /// worst case the UI thread's). A private message is inert everywhere else.
 const PUMP_STOP_MESSAGE: u32 = WM_APP + 1;
 
+/// Test-only thread message used to inject a change notification.
+///
+/// Only the test harness knows this message exists: production builds compile
+/// neither the constant nor its handler. The pump handles it on *its own*
+/// thread by calling the real [`request_scan`], so the wake-up flag is written
+/// in the same TLS slot the pump will read. A test thread never writes another
+/// thread's TLS directly -- that isolation is the property P2-1 established,
+/// and injecting through a thread message preserves it.
+#[cfg(test)]
+const PUMP_TEST_NOTIFICATION: u32 = WM_APP + 2;
+
+/// A distinctive trace of the injection path, present only in test builds.
+/// A non-test binary must contain none of it.
+#[cfg(test)]
+const TEST_INJECTION_MARKER: &str = "RUSTNT_TEST_ONLY_EVENT_INJECTION";
+
 /// The top-level window events the preview reacts to.
 ///
 /// Every change that can alter the list has a trigger: create, destroy, show,
@@ -442,6 +458,17 @@ fn drain_messages(message: &mut MSG) -> bool {
         if message.message == PUMP_STOP_MESSAGE {
             return false;
         }
+        #[cfg(test)]
+        {
+            // A synthetic notification is consumed here, on the pump thread,
+            // by the very function the WinEvent hook calls. Nothing else about
+            // the loop changes: the request still goes through
+            // take_scan_request -> pending_since -> coalescing -> scan().
+            if message.message == PUMP_TEST_NOTIFICATION {
+                request_scan();
+                continue;
+            }
+        }
         // SAFETY: the message was just filled in by `PeekMessageW` and is
         // dispatched unchanged to handlers owned by this thread.
         unsafe {
@@ -713,6 +740,85 @@ mod tests {
         None
     }
 
+    /// Post a synthetic notification to one monitor's pump thread.
+    ///
+    /// This is a queued thread message, **not** an OS WinEvent delivery: it
+    /// proves the in-process chain (`request_scan` -> `take_scan_request` ->
+    /// `pending_since` -> coalescing -> `scan`), while the OS hook dispatch
+    /// itself remains covered only by the manual preview check. Crucially the
+    /// test thread never writes the pump thread's TLS.
+    fn inject_test_notification(monitor: &WindowMonitor) {
+        let thread_id = monitor
+            .thread_id
+            .expect("the monitor must have completed its startup handshake");
+        // SAFETY: the pump published this id only after creating its message
+        // queue, so PostThreadMessageW has a valid target.
+        let posted = unsafe { PostThreadMessageW(thread_id, PUMP_TEST_NOTIFICATION, 0, 0) };
+        assert!(
+            posted != 0,
+            "could not post {TEST_INJECTION_MARKER} to pump thread {thread_id}"
+        );
+    }
+
+    /// Discard buffered events so the next `Snapshot` can only be a fresh one.
+    fn drain_buffered(monitor: &WindowMonitor) {
+        while monitor.try_recv().is_ok() {}
+    }
+
+    /// Spawn a real monitor and consume its first snapshot.
+    ///
+    /// The event-driven mode is required: with hooks unavailable the feed
+    /// polls every two seconds, and a snapshot inside the two second bound
+    /// would prove nothing about the hook -> flag -> scan wiring.
+    fn live_event_driven_monitor() -> WindowMonitor {
+        let monitor = WindowMonitor::spawn();
+        assert_eq!(
+            monitor.mode(),
+            FeedMode::EventDriven,
+            "the event-driven path is unavailable on this host; the wiring cannot be tested"
+        );
+        let first = next_event(&monitor, Instant::now() + Duration::from_secs(10));
+        assert!(
+            matches!(first, Some(FeedEvent::Snapshot(_))),
+            "monitor delivered no first snapshot: {first:?}"
+        );
+        drain_buffered(&monitor);
+        monitor
+    }
+
+    /// Require a new `WindowSnapshot` within two seconds of `requested`.
+    ///
+    /// A live channel or a process that is still running is not enough: only
+    /// an actual `FeedEvent::Snapshot` satisfies this.
+    fn snapshot_within_two_seconds(monitor: &WindowMonitor, requested: Instant) -> WindowSnapshot {
+        let deadline = requested + Duration::from_secs(2);
+        loop {
+            match monitor.try_recv() {
+                Ok(FeedEvent::Snapshot(snapshot)) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the injected notification took {:?}, which is not the event path",
+                        requested.elapsed()
+                    );
+                    return snapshot;
+                }
+                Ok(FeedEvent::Failure(message)) => {
+                    panic!("enumeration failed after the injected notification: {message}")
+                }
+                Err(TryRecvError::Disconnected) => {
+                    panic!("the pump exited after the injected notification")
+                }
+                Err(TryRecvError::Empty) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "no new WindowSnapshot within 2s of the injected notification"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_spawned_monitor_reports_a_mode_and_delivers_a_snapshot() {
         let monitor = WindowMonitor::spawn();
@@ -839,6 +945,131 @@ mod tests {
         assert!(
             feed_stops_within(&second, Duration::from_secs(10)),
             "the second monitor ignored its stop message"
+        );
+    }
+
+    /// Test A: the whole in-process refresh chain, restored after TLS isolation
+    /// made the old "write a global flag from the test thread" test impossible.
+    #[test]
+    fn an_injected_notification_produces_a_fresh_snapshot_within_two_seconds() {
+        let monitor = live_event_driven_monitor();
+
+        let requested = Instant::now();
+        inject_test_notification(&monitor);
+        let _snapshot = snapshot_within_two_seconds(&monitor, requested);
+
+        monitor.stop();
+    }
+
+    /// Test B: two live pumps must each react to their own notification.
+    /// With a process-global flag one of them would have lost the wake-up.
+    #[test]
+    fn two_monitors_each_refresh_on_their_own_injected_notification() {
+        let first = live_event_driven_monitor();
+        let second = live_event_driven_monitor();
+        drain_buffered(&first);
+        drain_buffered(&second);
+
+        let requested = Instant::now();
+        inject_test_notification(&first);
+        inject_test_notification(&second);
+
+        let _first_snapshot = snapshot_within_two_seconds(&first, requested);
+        let _second_snapshot = snapshot_within_two_seconds(&second, requested);
+
+        first.stop();
+        second.stop();
+    }
+
+    /// Test C: shutting one pump down must not disturb the survivor's refresh.
+    #[test]
+    fn stopping_one_monitor_does_not_break_the_survivors_refresh() {
+        let first = live_event_driven_monitor();
+        let second = live_event_driven_monitor();
+        drain_buffered(&first);
+        drain_buffered(&second);
+
+        first.stop();
+        assert!(
+            feed_stops_within(&first, Duration::from_secs(10)),
+            "the first monitor ignored its stop message"
+        );
+
+        let requested = Instant::now();
+        inject_test_notification(&second);
+        let _snapshot = snapshot_within_two_seconds(&second, requested);
+
+        second.stop();
+        assert!(
+            feed_stops_within(&second, Duration::from_secs(10)),
+            "the survivor ignored its stop message"
+        );
+    }
+
+    /// Test D (runtime half): a test notification is not a stop message, and
+    /// the real stop message still works after one was delivered.
+    #[test]
+    fn the_test_notification_is_not_mistaken_for_the_stop_message() {
+        assert_ne!(PUMP_TEST_NOTIFICATION, PUMP_STOP_MESSAGE);
+
+        let monitor = live_event_driven_monitor();
+        let requested = Instant::now();
+        inject_test_notification(&monitor);
+        let _snapshot = snapshot_within_two_seconds(&monitor, requested);
+
+        // Still delivering after the injection: it did not exit the pump.
+        let until = Instant::now() + Duration::from_millis(600);
+        while Instant::now() < until {
+            match monitor.try_recv() {
+                Ok(_) => continue,
+                Err(TryRecvError::Empty) => thread::sleep(Duration::from_millis(20)),
+                Err(TryRecvError::Disconnected) => {
+                    panic!("the test notification was handled as a stop message")
+                }
+            }
+        }
+
+        monitor.stop();
+        assert!(
+            feed_stops_within(&monitor, Duration::from_secs(10)),
+            "the stop message no longer works after a test notification"
+        );
+    }
+
+    /// Whether the line containing `needle` is preceded by a `#[cfg(test)]`
+    /// attribute within `window` lines. Doc comments in between are skipped by
+    /// simply searching the whole window.
+    fn cfg_test_gated(source: &str, needle: &str, window: usize) -> bool {
+        let lines: Vec<&str> = source.lines().collect();
+        let Some(index) = lines.iter().position(|line| line.contains(needle)) else {
+            return false;
+        };
+        let start = index.saturating_sub(window);
+        lines[start..index]
+            .iter()
+            .rev()
+            .any(|line| line.trim() == "#[cfg(test)]")
+    }
+
+    /// Test D (structural half): production builds must not contain the
+    /// injection constant, its marker, or the pump's handler for it. A test
+    /// build cannot observe cfg(test)-excluded code at runtime, so this pins
+    /// the source gating; the definitive check is a non-test build plus a
+    /// binary scan for `TEST_INJECTION_MARKER` (see the task report).
+    #[test]
+    fn the_injection_path_is_excluded_from_production_builds() {
+        let source = include_str!("window_events.rs");
+        assert!(
+            cfg_test_gated(source, "const PUMP_TEST_NOTIFICATION", 24),
+            "the test notification constant must be cfg(test)-gated"
+        );
+        assert!(
+            cfg_test_gated(source, "const TEST_INJECTION_MARKER", 8),
+            "the injection marker must be cfg(test)-gated"
+        );
+        assert!(
+            cfg_test_gated(source, "if message.message == PUMP_TEST_NOTIFICATION", 8),
+            "the pump's test-message handler must be cfg(test)-gated"
         );
     }
 
