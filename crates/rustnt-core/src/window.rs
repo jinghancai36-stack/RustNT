@@ -468,6 +468,26 @@ pub fn enumerate_windows() -> Result<WindowSnapshot, WindowError> {
     })
 }
 
+/// Handle of the current foreground window, without resolving it.
+///
+/// [`foreground_window`] builds a full [`WindowInfo`] (process snapshot, class
+/// name, window text), which is far too expensive to call on every UI frame.
+/// Callers that only need the identity of the foreground window -- such as the
+/// desktop preview correcting its highlight between snapshots -- should use
+/// this instead: it is a single message-free query.
+pub fn foreground_window_handle() -> Option<usize> {
+    let hwnd = unsafe {
+        // SAFETY: GetForegroundWindow has no pointer or handle preconditions and
+        // returns a null handle when no window has the foreground.
+        GetForegroundWindow()
+    };
+    if hwnd.is_null() {
+        None
+    } else {
+        Some(hwnd as usize)
+    }
+}
+
 pub fn foreground_window() -> Result<Option<WindowInfo>, WindowError> {
     let hwnd = unsafe {
         // SAFETY: GetForegroundWindow has no pointer or handle preconditions.
@@ -720,9 +740,10 @@ pub fn activate_window(hwnd: usize) -> Result<ActivationOutcome, WindowError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        activation_outcome, activation_precheck, enumerate_windows, foreground_window, format_hwnd,
-        list_sessions, map_session_state, may_send_window_messages, optional_text, wide_string,
-        wide_string_from_ptr, ActivationOutcome, ActivationRejection, SessionState,
+        activation_outcome, activation_precheck, enumerate_windows, foreground_window,
+        foreground_window_handle, format_hwnd, list_sessions, map_session_state,
+        may_send_window_messages, optional_text, wide_string, wide_string_from_ptr,
+        ActivationOutcome, ActivationRejection, SessionState,
     };
 
     #[test]
@@ -871,6 +892,27 @@ mod tests {
             assert!(window.foreground);
             assert!(window.hwnd != 0);
             assert!(window.session_id > 0);
+        }
+    }
+
+    /// The cheap handle must name the same window as the resolved query.
+    ///
+    /// The two calls sample the foreground at different moments, so a change in
+    /// between is a skip rather than a failure: what this pins down is that the
+    /// handle is not resolved through some other window (a parent, an owner).
+    #[test]
+    #[cfg(windows)]
+    fn the_cheap_foreground_handle_names_the_resolved_foreground_window() {
+        let before = foreground_window_handle();
+        let resolved = foreground_window().expect("foreground query should not fail");
+        let after = foreground_window_handle();
+        if before != after {
+            eprintln!("skipping: the foreground window changed during the query");
+            return;
+        }
+        if let (Some(window), Some(handle)) = (resolved, before) {
+            assert_eq!(window.hwnd, handle);
+            assert!(window.foreground);
         }
     }
 

@@ -15,14 +15,19 @@
 //!
 //! * The hook procedure is installed with `WINEVENT_OUTOFCONTEXT`, so Windows
 //!   delivers events through this module's own message queue and never runs the
-//!   callback inside another process. The callback only stores a flag; it does
+//!   callback inside another process. The callback only sets a flag; it does
 //!   not enumerate windows, allocate, log, or take a lock.
+//! * An out-of-context hook is always called on the thread that installed it,
+//!   and that thread is the pump. The callback and the pump therefore share a
+//!   thread, which is why the wake-up flag lives in that thread's TLS and each
+//!   monitor owns its own: two monitors cannot consume each other's events and
+//!   nothing here assumes a process-wide singleton.
 //! * `enumerate_windows` runs on the pump thread, between message drains, so the
 //!   callback can never re-enter it.
 //! * Nothing here touches the registry, Winlogon, Explorer, the LocalSystem
 //!   service, or the Task17A shell recovery state.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::cell::Cell;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -98,28 +103,40 @@ pub const WATCHED_EVENTS: [u32; 8] = [
     EVENT_OBJECT_NAMECHANGE,
 ];
 
-/// Set by the hook procedure, consumed by the pump thread.
-///
-/// `WINEVENTPROC` has no user-data parameter, so this signal has to be
-/// process-global. That is sound here because the preview runs exactly one
-/// monitor per process and its hooks are removed before the pump exits; a
-/// leftover flag only causes one redundant enumeration.
-static EVENT_PENDING: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    /// Set by the hook procedure, consumed by this thread's pump loop.
+    ///
+    /// `WINEVENTPROC` receives no user-data pointer, so the signal cannot be
+    /// threaded through a callback argument. It does not need to be
+    /// process-global either: an out-of-context hook is always called on the
+    /// thread that installed it, and that thread is the pump. Keeping the flag
+    /// in that thread's TLS makes it per-monitor, so two monitors in one process
+    /// can never consume each other's wake-ups, and no process-wide singleton
+    /// assumption is needed.
+    ///
+    /// Access always goes through `try_with`, because the TLS block is
+    /// unavailable while it is being initialized or destroyed.
+    static EVENT_PENDING: Cell<bool> = const { Cell::new(false) };
+}
 
-/// Serializes tests that start a live pump.
-///
-/// [`EVENT_PENDING`] is process-global (Windows gives the hook procedure no
-/// user-data parameter), so two live pumps in the same test binary would steal
-/// each other's wake-ups. Tests that only inspect the scheduling math stay
-/// parallel; tests that spawn a pump take this lock.
-#[cfg(test)]
-pub(crate) static LIVE_PUMP_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Record that this thread's window list may have changed.
+fn request_scan() {
+    // Only reachable once this thread's TLS is gone, which happens after the
+    // pump loop has already returned: there is nothing left to wake.
+    let _ = EVENT_PENDING.try_with(|pending| pending.set(true));
+}
 
-#[cfg(test)]
-pub(crate) fn lock_live_pump() -> std::sync::MutexGuard<'static, ()> {
-    LIVE_PUMP_GUARD
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+/// Read and clear this thread's request.
+fn take_scan_request() -> bool {
+    // A missing TLS block means "no request", never a panic.
+    EVENT_PENDING
+        .try_with(|pending| pending.replace(false))
+        .unwrap_or(false)
+}
+
+/// Drop any stale request before a new pump starts on this thread.
+fn reset_scan_request() {
+    let _ = EVENT_PENDING.try_with(|pending| pending.set(false));
 }
 
 /// How the feed learns that the window list may have changed.
@@ -382,7 +399,7 @@ unsafe extern "system" fn win_event_proc(
     _event_time: u32,
 ) {
     if is_relevant_event(hwnd as usize, id_object, id_child) {
-        EVENT_PENDING.store(true, Ordering::Release);
+        request_scan();
     }
 }
 
@@ -471,6 +488,9 @@ fn scan(sender: &Sender<FeedEvent>) -> bool {
 
 fn run_pump(sender: Sender<FeedEvent>, ready_sender: Sender<MonitorReady>) {
     ensure_message_queue();
+    // The pump thread is fresh, but a recycled thread would inherit a stale
+    // request; clear it before the hooks can set it.
+    reset_scan_request();
 
     let hooks = install_hooks();
     let mode = if hooks.is_ok() {
@@ -508,7 +528,7 @@ fn run_pump(sender: Sender<FeedEvent>, ready_sender: Sender<MonitorReady>) {
         if !drain_messages(&mut message) {
             break;
         }
-        if EVENT_PENDING.swap(false, Ordering::AcqRel) && pending_since.is_none() {
+        if take_scan_request() && pending_since.is_none() {
             pending_since = Some(Instant::now());
         }
 
@@ -695,7 +715,6 @@ mod tests {
 
     #[test]
     fn a_spawned_monitor_reports_a_mode_and_delivers_a_snapshot() {
-        let _guard = lock_live_pump();
         let monitor = WindowMonitor::spawn();
         let event = next_event(&monitor, Instant::now() + Duration::from_secs(10));
 
@@ -726,46 +745,113 @@ mod tests {
 
     #[test]
     fn stopping_the_monitor_disconnects_the_feed() {
-        let _guard = lock_live_pump();
         let monitor = WindowMonitor::spawn();
         monitor.stop();
+        assert!(
+            feed_stops_within(&monitor, Duration::from_secs(10)),
+            "the pump thread ignored the stop message"
+        );
+    }
 
+    /// The wake-up flag must be per thread, not per process.
+    ///
+    /// This is the mechanism that P2-1 was about: with a process-global flag,
+    /// whichever pump swapped it first consumed the other pump's notification.
+    /// A request made on one thread must be invisible to every other thread and
+    /// must stay visible to the thread that made it.
+    #[test]
+    fn scan_requests_are_private_to_the_thread_that_made_them() {
+        take_scan_request(); // start from a clean slate on this thread
+        request_scan();
+
+        let observed_elsewhere = thread::spawn(take_scan_request)
+            .join()
+            .expect("probe thread must not panic");
+        assert!(
+            !observed_elsewhere,
+            "another thread consumed this thread's scan request"
+        );
+
+        assert!(
+            take_scan_request(),
+            "the request must survive a foreign read"
+        );
+        assert!(!take_scan_request(), "reading must clear the request");
+    }
+
+    #[test]
+    fn a_reset_drops_a_stale_request() {
+        request_scan();
+        reset_scan_request();
+        assert!(!take_scan_request());
+    }
+
+    /// Two monitors must be fully independent: separate snapshots, separate
+    /// shutdown, no shared notification state.
+    ///
+    /// Coverage note: this exercises two live pumps and their hooks, but the
+    /// refresh is not injected -- with a per-thread flag a test thread cannot
+    /// write another thread's TLS, which is exactly the isolation being claimed.
+    /// Real OS WinEvent distribution to two pumps is therefore only covered by
+    /// the manual preview check.
+    #[test]
+    fn two_monitors_deliver_and_stop_independently() {
+        let first = WindowMonitor::spawn();
+        let second = WindowMonitor::spawn();
         let deadline = Instant::now() + Duration::from_secs(10);
+
+        let first_snapshot = next_event(&first, deadline);
+        let second_snapshot = next_event(&second, deadline);
+        assert!(
+            matches!(first_snapshot, Some(FeedEvent::Snapshot(_))),
+            "the first monitor delivered no snapshot"
+        );
+        assert!(
+            matches!(second_snapshot, Some(FeedEvent::Snapshot(_))),
+            "the second monitor delivered no snapshot"
+        );
+
+        // Stopping one must not disturb the other.
+        first.stop();
+        assert!(
+            feed_stops_within(&first, Duration::from_secs(10)),
+            "the first monitor ignored its stop message"
+        );
+
+        // The survivor must still be alive and healthy, not failed or dropped.
+        let survivor = Instant::now() + Duration::from_millis(600);
+        while Instant::now() < survivor {
+            match second.try_recv() {
+                Ok(FeedEvent::Failure(message)) => {
+                    panic!("stopping one monitor broke the other: {message}")
+                }
+                Ok(FeedEvent::Snapshot(_)) | Err(TryRecvError::Empty) => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    panic!("stopping one monitor disconnected the other")
+                }
+            }
+        }
+
+        // Both must clean up.
+        second.stop();
+        assert!(
+            feed_stops_within(&second, Duration::from_secs(10)),
+            "the second monitor ignored its stop message"
+        );
+    }
+
+    /// Drain a monitor until it reports closure, or the deadline passes.
+    fn feed_stops_within(monitor: &WindowMonitor, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             match monitor.try_recv() {
                 Ok(_) => continue,
                 Err(TryRecvError::Empty) => thread::sleep(Duration::from_millis(20)),
-                Err(TryRecvError::Disconnected) => return,
+                Err(TryRecvError::Disconnected) => return true,
             }
         }
-        panic!("the pump thread ignored the stop message");
-    }
-
-    /// Latency bound on the wake-up path.
-    ///
-    /// The event is synthesized by setting the same flag the hook procedure
-    /// sets, because a test cannot change a real window without disturbing the
-    /// desktop it runs on. This proves the pump drains its queue, honours the
-    /// coalescing window, and produces a snapshot long before the reconcile
-    /// interval; the OS delivery path itself is covered by the manual preview
-    /// check.
-    #[test]
-    fn a_pending_event_produces_a_snapshot_before_the_reconcile_interval() {
-        let _guard = lock_live_pump();
-        let monitor = WindowMonitor::spawn();
-        let first = next_event(&monitor, Instant::now() + Duration::from_secs(10));
-        assert!(first.is_some(), "monitor delivered no first snapshot");
-
-        // Let the pump settle, then ask for a refresh.
-        EVENT_PENDING.store(true, Ordering::Release);
-        let requested = Instant::now();
-        let second = next_event(&monitor, requested + Duration::from_secs(5));
-        let elapsed = requested.elapsed();
-
-        assert!(second.is_some(), "signalled change produced no snapshot");
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "a signalled change took {elapsed:?}, which is the polling path, not the event path"
-        );
+        false
     }
 }

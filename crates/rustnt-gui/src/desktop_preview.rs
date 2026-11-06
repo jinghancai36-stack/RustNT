@@ -14,7 +14,9 @@ use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use rustnt_core::window::{activate_window, ActivationOutcome, WindowInfo, WindowSnapshot};
+use rustnt_core::window::{
+    activate_window, foreground_window_handle, ActivationOutcome, WindowInfo, WindowSnapshot,
+};
 
 use crate::window_events::{FeedEvent, FeedMode, WindowMonitor};
 
@@ -106,6 +108,25 @@ pub fn collect_window_items(snapshot: &WindowSnapshot, self_pid: u32) -> Vec<Win
             minimized: window.minimized,
         })
         .collect()
+}
+
+/// Point the foreground marker at `foreground_hwnd`, clearing every other item.
+///
+/// The snapshot already carries a foreground flag, but it is stale exactly when
+/// the foreground moved to a window the feed does not hear about. The preview's
+/// own window is the important case: it is installed with
+/// `WINEVENT_SKIPOWNPROCESS`, so activating it produces no event at all, and
+/// without this correction the last external application would keep its marker
+/// for up to a full reconcile interval.
+///
+/// A foreground handle that matches nothing in the list (the preview itself, a
+/// shell window, a hidden window, or `None` when the foreground window was
+/// destroyed) must clear the marker rather than leave the previous application
+/// looking active.
+pub fn mark_foreground(items: &mut [WindowListItem], foreground_hwnd: Option<usize>) {
+    for item in items.iter_mut() {
+        item.foreground = Some(item.hwnd) == foreground_hwnd;
+    }
 }
 
 pub fn sort_window_items(items: &mut [WindowListItem]) {
@@ -318,6 +339,10 @@ impl DesktopPreviewApp {
             return Vec::new();
         };
         let mut items = collect_window_items(snapshot, std::process::id());
+        // One message-free query per frame, not a re-enumeration: the list order
+        // and the highlight stay correct even for focus changes the event feed
+        // is designed not to see.
+        mark_foreground(&mut items, foreground_window_handle());
         sort_window_items(&mut items);
         items
     }
@@ -566,6 +591,75 @@ mod tests {
     }
 
     #[test]
+    fn a_foreground_change_between_two_external_windows_moves_the_marker() {
+        let mut items = vec![item("Alpha", 1, true), item("Beta", 2, false)];
+
+        mark_foreground(&mut items, Some(2));
+
+        assert!(!items[0].foreground);
+        assert!(items[1].foreground);
+        // The marker is applied before sorting, so the highlight also moves to
+        // the top of the list.
+        sort_window_items(&mut items);
+        assert_eq!(items[0].hwnd, 2);
+    }
+
+    #[test]
+    fn focus_on_the_preview_window_clears_every_external_marker() {
+        // The preview filters its own window out of the list, so the handle can
+        // never match an item. The last external application must not keep
+        // looking active just because nothing replaced it in the list.
+        let preview_hwnd = 999;
+        let mut items = vec![item("Alpha", 1, true), item("Beta", 2, false)];
+
+        mark_foreground(&mut items, Some(preview_hwnd));
+
+        assert!(items.iter().all(|item| !item.foreground));
+    }
+
+    #[test]
+    fn focus_returning_to_an_external_window_restores_its_marker() {
+        let mut items = vec![item("Alpha", 1, false), item("Beta", 2, false)];
+        mark_foreground(&mut items, Some(999));
+        assert!(items.iter().all(|item| !item.foreground));
+
+        mark_foreground(&mut items, Some(1));
+
+        assert!(items[0].foreground);
+        assert!(!items[1].foreground);
+    }
+
+    #[test]
+    fn a_foreground_window_missing_from_the_list_clears_every_marker() {
+        // A shell window, a hidden window, or a window on another virtual
+        // desktop: filtered out of the list, but still the foreground.
+        let mut items = vec![item("Alpha", 1, true), item("Beta", 2, false)];
+
+        mark_foreground(&mut items, Some(0xdead_beef));
+
+        assert!(items.iter().all(|item| !item.foreground));
+    }
+
+    #[test]
+    fn a_destroyed_foreground_window_clears_every_marker() {
+        // GetForegroundWindow returns nothing while the desktop has no
+        // foreground window (for example right after it was destroyed).
+        let mut items = vec![item("Alpha", 1, true)];
+
+        mark_foreground(&mut items, None);
+
+        assert!(!items[0].foreground);
+    }
+
+    #[test]
+    fn an_empty_list_accepts_any_foreground() {
+        let mut items: Vec<WindowListItem> = Vec::new();
+        mark_foreground(&mut items, Some(7));
+        mark_foreground(&mut items, None);
+        assert!(items.is_empty());
+    }
+
+    #[test]
     fn sorting_is_case_insensitive_and_stable_for_equal_titles() {
         let mut items = vec![
             item("Beta", 3, false),
@@ -768,7 +862,6 @@ mod tests {
 
     #[test]
     fn spawned_feed_delivers_a_snapshot() {
-        let _guard = crate::window_events::lock_live_pump();
         let mut feed = WindowFeed::spawn();
         // No snapshot at all within the deadline is a feed failure, not an
         // environment limitation: it must fail loudly.
