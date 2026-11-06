@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod config;
+pub mod desktop_preview;
 pub mod file_browser;
 pub mod navigation;
 pub mod notifications;
@@ -15,6 +16,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use app::{viewport_for, RustNtApp, SharedConfig};
 use config::{config_paths_from_appdata, load_config, save_config, ConfigError, GuiConfig};
+use desktop_preview::{
+    parse_startup_mode, DesktopPreviewApp, StartupMode, PREVIEW_FLAG, PREVIEW_WINDOW_TITLE,
+};
 use recovery::{create_marker, inspect, install_panic_hook, RecoveryError};
 use shell_recovery::{
     startup_notice, RecoveryLogError, ShellRecovery, StartupNotice, StartupOutcome,
@@ -235,8 +239,41 @@ fn run_gui() -> Result<(), GuiError> {
     )
 }
 
+fn run_preview() -> Result<(), GuiError> {
+    // The preview is intentionally isolated from configuration, the GUI crash
+    // marker, and the Task17A shell recovery session: it must never be able to
+    // influence a real shell recovery decision.
+    let options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_title(PREVIEW_WINDOW_TITLE)
+            .with_inner_size([960.0, 640.0])
+            .with_min_inner_size([640.0, 400.0]),
+        ..Default::default()
+    };
+    eframe::run_native(
+        PREVIEW_WINDOW_TITLE,
+        options,
+        Box::new(move |_creation_context| Ok(Box::new(DesktopPreviewApp::new()))),
+    )
+    .map_err(GuiError::from)
+}
+
 fn main() {
-    if let Err(error) = run_gui() {
+    let mode = match parse_startup_mode(std::env::args().skip(1)) {
+        Ok(mode) => mode,
+        Err(error) => {
+            eprintln!("RustNT GUI failed: {error}");
+            eprintln!("usage: rustnt-gui [{PREVIEW_FLAG}]");
+            std::process::exit(2);
+        }
+    };
+
+    let result = match mode {
+        StartupMode::Standard => run_gui(),
+        StartupMode::DesktopPreview => run_preview(),
+    };
+
+    if let Err(error) = result {
         eprintln!("RustNT GUI failed: {error}");
         std::process::exit(1);
     }
