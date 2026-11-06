@@ -1,25 +1,25 @@
-//! Read-only desktop preview (Task 01A).
+//! Read-only desktop preview (Task 01A / 01B).
 //!
 //! The preview renders a normal, closable `eframe` window that lists the
 //! current top-level application windows and can raise one of them. It never
 //! touches the registry, Winlogon, Explorer, the LocalSystem service, or the
 //! Task17A shell recovery state.
+//!
+//! Window discovery lives in [`crate::window_events`]: snapshots arrive when
+//! something changed, with a polling fallback when the event hooks are
+//! unavailable. This module only turns snapshots into list state.
 
 use std::fmt;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::thread;
+use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use rustnt_core::window::{
-    activate_window, enumerate_windows, ActivationOutcome, WindowInfo, WindowSnapshot,
-};
+use rustnt_core::window::{activate_window, ActivationOutcome, WindowInfo, WindowSnapshot};
+
+use crate::window_events::{FeedEvent, FeedMode, WindowMonitor};
 
 pub const PREVIEW_FLAG: &str = "--desktop-preview";
 pub const PREVIEW_WINDOW_TITLE: &str = "RustNT Desktop - Preview";
-pub const PREVIEW_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
-/// A feed that has produced no event at all for this long is reported as stuck.
-pub const PREVIEW_STALL_TIMEOUT: Duration = Duration::from_secs(6);
 pub const MAX_TASKBAR_ITEMS: usize = 8;
 
 /// Top-level windows that belong to the Windows shell itself rather than to an
@@ -140,17 +140,10 @@ pub fn activation_notice(outcome: ActivationOutcome) -> String {
     }
 }
 
-/// What the background feed reported to the UI thread.
-///
-/// A failed enumeration is an event, not an absence of events: without it the
-/// UI cannot tell "no snapshot yet" from "enumeration keeps failing".
-#[derive(Debug)]
-enum FeedEvent {
-    Snapshot(WindowSnapshot),
-    Failure(String),
-}
-
 /// UI-visible state of the window feed.
+///
+/// The events themselves are [`FeedEvent`]; a failed enumeration arrives as one,
+/// so the UI can tell "no snapshot yet" from "enumeration keeps failing".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreviewState {
     /// No result has arrived yet.
@@ -174,19 +167,22 @@ pub fn empty_list_notice(state: &PreviewState) -> String {
 ///
 /// `since_last_event` also covers a feed thread that is still alive but blocked
 /// inside a Win32 call: it never sends an error, so only the absence of events
-/// can reveal the stall.
+/// can reveal the stall. `stall_timeout` comes from the feed mode, because a
+/// silent event-driven feed is normal on an idle desktop while a silent polling
+/// feed is not.
 pub fn preview_state(
     has_snapshot: bool,
     last_error: Option<&str>,
     disconnected: bool,
     since_last_event: Duration,
+    stall_timeout: Duration,
 ) -> PreviewState {
     if disconnected {
         return PreviewState::Failed(
             "the background window feed stopped, so the list no longer updates".to_owned(),
         );
     }
-    if since_last_event >= PREVIEW_STALL_TIMEOUT {
+    if since_last_event >= stall_timeout {
         return PreviewState::Failed(format!(
             "no window snapshot arrived for {}s; window enumeration appears to be blocked",
             since_last_event.as_secs()
@@ -202,7 +198,7 @@ pub fn preview_state(
 }
 
 pub struct WindowFeed {
-    receiver: Receiver<FeedEvent>,
+    monitor: WindowMonitor,
     latest: Option<WindowSnapshot>,
     last_error: Option<String>,
     disconnected: bool,
@@ -212,26 +208,12 @@ pub struct WindowFeed {
 
 impl WindowFeed {
     pub fn spawn() -> Self {
-        let (sender, receiver) = mpsc::channel();
-        thread::Builder::new()
-            .name("rustnt-window-feed".to_owned())
-            .spawn(move || loop {
-                let event = match enumerate_windows() {
-                    Ok(snapshot) => FeedEvent::Snapshot(snapshot),
-                    Err(error) => FeedEvent::Failure(error.to_string()),
-                };
-                if sender.send(event).is_err() {
-                    break;
-                }
-                thread::sleep(PREVIEW_REFRESH_INTERVAL);
-            })
-            .expect("spawn window feed thread");
-        Self::from_receiver(receiver)
+        Self::from_monitor(WindowMonitor::spawn())
     }
 
-    fn from_receiver(receiver: Receiver<FeedEvent>) -> Self {
+    fn from_monitor(monitor: WindowMonitor) -> Self {
         Self {
-            receiver,
+            monitor,
             latest: None,
             last_error: None,
             disconnected: false,
@@ -240,15 +222,22 @@ impl WindowFeed {
         }
     }
 
+    /// Feed over a caller-owned channel; used by unit tests to inject events.
+    #[cfg(test)]
+    fn from_receiver(receiver: std::sync::mpsc::Receiver<FeedEvent>) -> Self {
+        Self::from_monitor(WindowMonitor::from_receiver(receiver))
+    }
+
     pub fn poll(&mut self) -> bool {
         let mut updated = false;
         loop {
-            match self.receiver.try_recv() {
+            match self.monitor.try_recv() {
                 Ok(FeedEvent::Snapshot(snapshot)) => {
                     if self.latest.is_none() {
                         let usable = collect_window_items(&snapshot, std::process::id()).len();
                         eprintln!(
-                            "[rustnt-preview] first window snapshot: {} windows, {usable} listed",
+                            "[rustnt-preview] first window snapshot ({}): {} windows, {usable} listed",
+                            self.mode().label(),
                             snapshot.windows.len()
                         );
                     }
@@ -287,6 +276,15 @@ impl WindowFeed {
         self.last_error.as_deref()
     }
 
+    pub fn mode(&self) -> FeedMode {
+        self.monitor.mode()
+    }
+
+    /// Why the feed is not using window events, if it is not.
+    pub fn mode_notice(&self) -> Option<&str> {
+        self.monitor.fallback_reason()
+    }
+
     fn since_last_event(&self) -> Duration {
         self.last_event_at.unwrap_or(self.started).elapsed()
     }
@@ -297,6 +295,7 @@ impl WindowFeed {
             self.last_error.as_deref(),
             self.disconnected,
             self.since_last_event(),
+            self.mode().stall_timeout(),
         )
     }
 }
@@ -349,6 +348,11 @@ impl eframe::App for DesktopPreviewApp {
                         .strong()
                         .color(egui::Color32::from_rgb(0x2f, 0x9e, 0x6f)),
                 );
+                ui.label(
+                    egui::RichText::new(format!("updates: {}", self.feed.mode().label()))
+                        .weak()
+                        .size(11.0),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Exit Preview").clicked() {
                         Self::request_close(&ctx);
@@ -396,6 +400,12 @@ impl eframe::App for DesktopPreviewApp {
                     egui::Color32::from_rgb(0xf0, 0xc0, 0x60),
                     format!("Last refresh failed: {error}"),
                 );
+            } else if let Some(reason) = self.feed.mode_notice() {
+                // Degraded, not broken: the list still updates, just on a timer.
+                ui.colored_label(
+                    egui::Color32::from_rgb(0xf0, 0xc0, 0x60),
+                    format!("Window events unavailable: {reason}"),
+                );
             }
 
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -424,6 +434,25 @@ impl eframe::App for DesktopPreviewApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::window_events::{EVENT_STALL_TIMEOUT, POLLING_STALL_TIMEOUT};
+    use std::sync::mpsc;
+    use std::thread;
+
+    /// Shorthand for the state decision in event-driven mode.
+    fn event_state(
+        has_snapshot: bool,
+        last_error: Option<&str>,
+        disconnected: bool,
+        since_last_event: Duration,
+    ) -> PreviewState {
+        preview_state(
+            has_snapshot,
+            last_error,
+            disconnected,
+            since_last_event,
+            EVENT_STALL_TIMEOUT,
+        )
+    }
 
     fn window(class_name: &str, title: &str, pid: u32, visible: bool) -> WindowInfo {
         WindowInfo {
@@ -573,7 +602,7 @@ mod tests {
     #[test]
     fn waiting_is_only_reported_before_the_first_event() {
         assert_eq!(
-            preview_state(false, None, false, Duration::from_millis(200)),
+            event_state(false, None, false, Duration::from_millis(200)),
             PreviewState::Waiting
         );
         assert_eq!(
@@ -646,9 +675,45 @@ mod tests {
 
     #[test]
     fn a_silent_feed_is_reported_as_blocked_after_the_stall_timeout() {
-        let state = preview_state(false, None, false, PREVIEW_STALL_TIMEOUT);
+        let state = preview_state(false, None, false, EVENT_STALL_TIMEOUT, EVENT_STALL_TIMEOUT);
         assert!(matches!(state, PreviewState::Failed(_)));
         assert!(empty_list_notice(&state).contains("blocked"));
+    }
+
+    #[test]
+    fn an_idle_event_driven_feed_is_not_a_stall() {
+        // Nothing arrives between reconciliations; that is normal, not broken.
+        let idle = event_state(
+            true,
+            None,
+            false,
+            EVENT_STALL_TIMEOUT - Duration::from_secs(1),
+        );
+        assert_eq!(idle, PreviewState::Ready);
+
+        // The same silence in polling mode means three missed refreshes.
+        let polling = preview_state(
+            true,
+            None,
+            false,
+            POLLING_STALL_TIMEOUT,
+            POLLING_STALL_TIMEOUT,
+        );
+        assert!(matches!(polling, PreviewState::Failed(_)));
+        assert_eq!(
+            event_state(true, None, false, POLLING_STALL_TIMEOUT),
+            PreviewState::Ready
+        );
+    }
+
+    #[test]
+    fn the_feed_reports_the_mode_it_is_using() {
+        let (sender, receiver) = mpsc::channel();
+        let feed = WindowFeed::from_receiver(receiver);
+        assert_eq!(feed.mode(), FeedMode::EventDriven);
+        assert!(feed.mode_notice().is_none());
+        assert_eq!(feed.mode().label(), "event-driven");
+        drop(sender);
     }
 
     #[test]
@@ -703,6 +768,7 @@ mod tests {
 
     #[test]
     fn spawned_feed_delivers_a_snapshot() {
+        let _guard = crate::window_events::lock_live_pump();
         let mut feed = WindowFeed::spawn();
         // No snapshot at all within the deadline is a feed failure, not an
         // environment limitation: it must fail loudly.
