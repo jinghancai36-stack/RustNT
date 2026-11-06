@@ -11,5 +11,8 @@ Thumbs.db
 .env
 *.log
 
+# Local agent state
+.workbuddy/
+
 # Rust backup files
 *.rs.bk
