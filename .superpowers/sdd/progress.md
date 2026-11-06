@@ -178,3 +178,7 @@ produce typed audit events. Rate-limited events omit the unvalidated requested P
   results and explicit GUI smoke-test status. The final serial workspace test,
   check, build, Clippy, format, diff, and boundary-scan commands were run on
   2026-10-01. No real GUI smoke test was executed.
+# Task 17B execution
+
+- Task 1: complete (commits `bebc53d..3fba0a1`, review clean; spec and quality PASS).
+

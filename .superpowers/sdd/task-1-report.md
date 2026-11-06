@@ -1,71 +1,44 @@
-# Task 1: Deterministic Page Navigation
+# Task 1 Report
 
-## Implementation
+Status: DONE
 
-Implemented the Task15 deterministic page navigation model in `crates/rustnt-gui/src/navigation.rs` and declared the module in `crates/rustnt-gui/src/main.rs` without changing startup order.
+Commit: `b937a48772a83b0d3a6da9f7dbf3b0e372b575b2`
 
-The model provides:
+Implemented the `rustnt-shell-switch` policy crate and added it to the workspace. The crate currently defines the Task 1 fixed domain types and transaction state transition policy. It contains no Windows Registry or ACL adapter.
 
-- `PageId` with exactly `Overview`, `SystemMonitor`, and `WindowsSessions`, in that order.
-- `NavigationState`, whose default is `Overview` with `switcher_open` set to `false`.
-- A fixed `pages()` slice.
-- Exhaustive stable `page_title` and `page_label` mappings.
-- `page_for_shortcut`, mapping Ctrl+1, Ctrl+2, and Ctrl+3 to the three pages and rejecting non-Ctrl and unknown keys.
+Verification run in the isolated worktree:
 
-## Files
+- `cargo test -p rustnt-shell-switch`: 3 unit tests passed; 0 failed; doc tests passed. Cargo emitted the repository's existing TOML semver metadata warning.
+- `cargo fmt --all -- --check`: passed after formatting.
+- `git diff --check`: passed.
 
-- `crates/rustnt-gui/src/main.rs`: added `pub mod navigation;`.
-- `crates/rustnt-gui/src/navigation.rs`: added the route model and five focused unit tests.
-- `.superpowers/sdd/task-1-report.md`: this implementation report.
+TDD evidence: the added `failed_state_requires_recovery_validation_before_restore_request` test was run against the permissive transition table and failed on the assertion as expected; after removing that transition, all 3 tests passed. The initial state-sequence tests were present in the first shared implementation snapshot, so their red run was not observed by the controller.
 
-The generated `.superpowers/sdd/task-1-brief.md` was left uncommitted.
+Execution note: the implementer subagent failed twice with backend HTTP 502. The controller completed the narrowly scoped Task 1 implementation in the isolated worktree; this did not change the implementation boundary.
 
-## RED
+## Independent Review
 
-Command:
+Review scope: Task 1 brief and diff `bebc53dc918262b8c6988d679ea88b20e93dfb82..3fba0a164ed0f83260285a9626bc5dd75c28c7e8`.
 
-```text
-cargo test -p rustnt-gui navigation -- --nocapture
-```
+### Verdicts
 
-Result: expected compilation failure before implementation. The compiler reported unresolved imports for `page_for_shortcut`, `page_label`, `page_title`, `pages`, `NavigationState`, and `PageId` in `navigation.rs`. The initial test-only `egui::Key` import was also corrected to `eframe::egui::Key`; the subsequent RED run failed only on the absent navigation API.
+- Spec compliance: **PASS** after the review fix.
+- Quality: **PASS** after the review fix; Task 4 coordinator owns recovery precondition validation.
 
-## GREEN
+### Finding
 
-Command:
+- **Resolved [P1]:** The initial review found that validated failed transactions could not enter recovery. The user chose to allow the state edge in the context-free policy and require the Task 4 coordinator to validate the registry value and backup before taking it. The implementation now includes `Failed -> RestoreRequested`, and the focused test covers that edge.
 
-```text
-cargo test -p rustnt-gui navigation -- --nocapture
-```
+### Constraint check
 
-Result:
+The diff adds only a policy crate and workspace membership. It introduces no registry I/O, Winlogon writes, GUI or service behavior, raw-value transaction logging, or test access to real HKLM. The fixed-domain transaction and audit structures contain metadata and fixed error categories, not raw registry bytes. No Task17A behavior is changed in this diff.
 
-```text
-running 5 tests
-...
-test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 36 filtered out
-```
+## Review Fix
 
-## Tests
+Applied the requested policy correction: `Failed -> RestoreRequested` is now an allowed state edge after the Task 4 coordinator has validated recovery prerequisites. The focused test now asserts the permitted edge, and the full transition table includes it.
 
-Fresh verification after formatting:
+Fix commit: `3fba0a164ed0f83260285a9626bc5dd75c28c7e8`
 
-- `cargo fmt --all -- --check`: passed, exit code 0.
-- `cargo test -p rustnt-gui navigation -- --nocapture`: passed, 5 passed and 0 failed.
-- `cargo test -p rustnt-gui -- --nocapture`: passed, 41 passed and 0 failed.
+Fresh verification: `cargo fmt --all`, `cargo test -p rustnt-shell-switch` (3 passed, 0 failed), `cargo fmt --all -- --check`, and `git diff --check` all passed.
 
-The full suite prints the panic message from the existing lock-poisoning test while catching that panic as part of the test; the suite still exits successfully. Cargo also reports the pre-existing warning that the `toml` dependency version requirement contains ignored semver metadata.
-
-## Self-review
-
-- Scope is limited to the requested module declaration, new navigation module, and this report.
-- `app.rs` and unrelated files are unchanged.
-- `PageId` order is explicit and covered by a test.
-- Labels, titles, default state, shortcut mappings, non-Ctrl rejection, and unknown-key rejection are covered by focused tests.
-- Shortcut handling is exhaustive for the supported keys and returns `None` for all other keys.
-- Formatting and the complete existing GUI test suite pass.
-
-## Concerns
-
-- The full test suite retains the existing expected panic output from the lock-poisoning test, which can look alarming in logs despite the successful result.
-- Cargo emits the existing `toml` semver metadata warning; it is outside Task 1 scope and was not changed.
+Re-review: Spec PASS and Quality PASS. The reviewer confirmed the state edge at `crates/rustnt-shell-switch/src/lib.rs:49` and its test at line 237. Task 4 coordinator validation remains an explicit implementation requirement.
