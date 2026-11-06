@@ -632,6 +632,26 @@ pub fn activation_precheck(
     None
 }
 
+/// Classifies one activation attempt from the facts the caller has already read.
+///
+/// The real foreground window decides: `SetForegroundWindow` can report failure
+/// while another party already raised the target, and it does not reliably set
+/// the last error. A zero error code therefore never means success; it only
+/// means Windows reported no code for a rejection.
+pub fn activation_outcome(
+    foreground_is_target: bool,
+    accepted: bool,
+    error_code: u32,
+) -> ActivationOutcome {
+    if foreground_is_target {
+        ActivationOutcome::Activated
+    } else if accepted {
+        ActivationOutcome::AcceptedButNotForeground
+    } else {
+        ActivationOutcome::Rejected { code: error_code }
+    }
+}
+
 /// Requests the foreground for one window.
 ///
 /// Only `SetForegroundWindow` is used. No `AttachThreadInput`, synthetic input,
@@ -682,30 +702,27 @@ pub fn activate_window(hwnd: usize) -> Result<ActivationOutcome, WindowError> {
         // SAFETY: see above; SetForegroundWindow only requests the foreground.
         SetForegroundWindow(hwnd as HWND)
     } != 0;
-    let foreground = unsafe {
-        // SAFETY: GetForegroundWindow has no preconditions.
-        GetForegroundWindow() as usize
-    };
+    // Read the error before any other call: later Win32 calls on this thread may
+    // overwrite the thread-local last error, which would make the reported code
+    // describe the wrong function.
     let code = unsafe {
         // SAFETY: GetLastError reads the thread-local error of this thread.
         GetLastError()
     };
+    let foreground = unsafe {
+        // SAFETY: GetForegroundWindow has no preconditions.
+        GetForegroundWindow() as usize
+    };
 
-    if foreground == hwnd {
-        Ok(ActivationOutcome::Activated)
-    } else if accepted {
-        Ok(ActivationOutcome::AcceptedButNotForeground)
-    } else {
-        Ok(ActivationOutcome::Rejected { code })
-    }
+    Ok(activation_outcome(foreground == hwnd, accepted, code))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        activation_precheck, enumerate_windows, foreground_window, format_hwnd, list_sessions,
-        map_session_state, may_send_window_messages, optional_text, wide_string,
-        wide_string_from_ptr, ActivationRejection, SessionState,
+        activation_outcome, activation_precheck, enumerate_windows, foreground_window, format_hwnd,
+        list_sessions, map_session_state, may_send_window_messages, optional_text, wide_string,
+        wide_string_from_ptr, ActivationOutcome, ActivationRejection, SessionState,
     };
 
     #[test]
@@ -868,5 +885,36 @@ mod tests {
             Some(ActivationRejection::OwnProcess)
         );
         assert_eq!(activation_precheck(true, 7, 42), None);
+    }
+
+    #[test]
+    fn activation_outcome_is_decided_by_the_real_foreground_window() {
+        // Another party already raised the target: the API result is not the truth.
+        assert_eq!(
+            activation_outcome(true, false, 0),
+            ActivationOutcome::Activated
+        );
+        assert_eq!(
+            activation_outcome(true, true, 5),
+            ActivationOutcome::Activated
+        );
+        // Accepted by the API, but Windows kept the previous foreground window.
+        assert_eq!(
+            activation_outcome(false, true, 0),
+            ActivationOutcome::AcceptedButNotForeground
+        );
+        // A zero error code is not success: the request was rejected without a code.
+        assert_eq!(
+            activation_outcome(false, false, 0),
+            ActivationOutcome::Rejected { code: 0 }
+        );
+        assert_ne!(
+            activation_outcome(false, false, 0),
+            ActivationOutcome::Activated
+        );
+        assert_eq!(
+            activation_outcome(false, false, 5),
+            ActivationOutcome::Rejected { code: 5 }
+        );
     }
 }

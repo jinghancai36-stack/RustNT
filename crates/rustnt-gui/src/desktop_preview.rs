@@ -129,6 +129,11 @@ pub fn activation_notice(outcome: ActivationOutcome) -> String {
             "Activation was accepted but Windows kept the foreground window (foreground policy limitation)."
                 .to_owned()
         }
+        // A zero code is not a success signal: Windows simply reported no code.
+        ActivationOutcome::Rejected { code: 0 } => {
+            "Windows rejected the foreground request without reporting an error code; this is an environment limitation."
+                .to_owned()
+        }
         ActivationOutcome::Rejected { code } => format!(
             "Windows rejected the foreground request (error {code}); this is an environment limitation."
         ),
@@ -685,15 +690,37 @@ mod tests {
         assert_eq!(feed.latest().unwrap().windows.len(), 1);
     }
 
+    /// Does this snapshot describe a session with no top-level window at all?
+    ///
+    /// That is what a non-interactive window station (session 0, headless CI)
+    /// looks like: `EnumWindows` succeeds and yields nothing. A filter
+    /// regression is excluded here because windows dropped by the session,
+    /// desktop or identity checks are counted in `skipped_windows`, so a broken
+    /// filter still reports non-zero skips instead of looking like this case.
+    fn no_interactive_desktop(snapshot: &WindowSnapshot) -> bool {
+        snapshot.windows.is_empty() && snapshot.skipped_windows == 0
+    }
+
     #[test]
     fn spawned_feed_delivers_a_snapshot() {
         let mut feed = WindowFeed::spawn();
+        // No snapshot at all within the deadline is a feed failure, not an
+        // environment limitation: it must fail loudly.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while std::time::Instant::now() < deadline && feed.latest().is_none() {
             feed.poll();
             thread::sleep(Duration::from_millis(50));
         }
         let snapshot = feed.latest().expect("feed must deliver a snapshot");
+
+        if no_interactive_desktop(snapshot) {
+            eprintln!(
+                "skipping spawned_feed_delivers_a_snapshot: this session has no interactive \
+                 desktop (windows=0, skipped=0)"
+            );
+            return;
+        }
+
         let items = collect_window_items(snapshot, std::process::id());
         println!(
             "snapshot windows={} skipped={} items={}",
@@ -703,7 +730,13 @@ mod tests {
         );
         assert!(
             !snapshot.windows.is_empty(),
-            "enumeration returned no windows"
+            "enumeration returned no windows while reporting {} skipped windows: \
+             the session/desktop filter is dropping every window",
+            snapshot.skipped_windows
+        );
+        assert!(
+            items.iter().all(|item| item.pid != std::process::id()),
+            "the preview list must never contain this process's own windows"
         );
     }
 
@@ -714,5 +747,10 @@ mod tests {
             activation_notice(ActivationOutcome::AcceptedButNotForeground).contains("foreground")
         );
         assert!(activation_notice(ActivationOutcome::Rejected { code: 5 }).contains("5"));
+        // A zero code is a rejection without a code, never a success message.
+        let zero = activation_notice(ActivationOutcome::Rejected { code: 0 });
+        assert!(zero.contains("rejected"));
+        assert!(zero.contains("without reporting an error code"));
+        assert!(!zero.contains("error 0"));
     }
 }
