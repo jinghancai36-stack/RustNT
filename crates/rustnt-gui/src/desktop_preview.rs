@@ -6,9 +6,9 @@
 //! Task17A shell recovery state.
 
 use std::fmt;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use rustnt_core::window::{
@@ -18,6 +18,8 @@ use rustnt_core::window::{
 pub const PREVIEW_FLAG: &str = "--desktop-preview";
 pub const PREVIEW_WINDOW_TITLE: &str = "RustNT Desktop - Preview";
 pub const PREVIEW_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+/// A feed that has produced no event at all for this long is reported as stuck.
+pub const PREVIEW_STALL_TIMEOUT: Duration = Duration::from_secs(6);
 pub const MAX_TASKBAR_ITEMS: usize = 8;
 
 /// Top-level windows that belong to the Windows shell itself rather than to an
@@ -133,9 +135,74 @@ pub fn activation_notice(outcome: ActivationOutcome) -> String {
     }
 }
 
+/// What the background feed reported to the UI thread.
+///
+/// A failed enumeration is an event, not an absence of events: without it the
+/// UI cannot tell "no snapshot yet" from "enumeration keeps failing".
+#[derive(Debug)]
+enum FeedEvent {
+    Snapshot(WindowSnapshot),
+    Failure(String),
+}
+
+/// UI-visible state of the window feed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviewState {
+    /// No result has arrived yet.
+    Waiting,
+    /// A snapshot has been received (it may still contain zero usable windows).
+    Ready,
+    /// The feed failed, stopped, or stopped making progress; the message is
+    /// user-facing.
+    Failed(String),
+}
+
+pub fn empty_list_notice(state: &PreviewState) -> String {
+    match state {
+        PreviewState::Waiting => "Waiting for the first window snapshot...".to_owned(),
+        PreviewState::Ready => "No application windows matched the preview filter.".to_owned(),
+        PreviewState::Failed(message) => format!("Window feed unavailable: {message}"),
+    }
+}
+
+/// Pure state decision, so the UI rules stay testable without threads or time.
+///
+/// `since_last_event` also covers a feed thread that is still alive but blocked
+/// inside a Win32 call: it never sends an error, so only the absence of events
+/// can reveal the stall.
+pub fn preview_state(
+    has_snapshot: bool,
+    last_error: Option<&str>,
+    disconnected: bool,
+    since_last_event: Duration,
+) -> PreviewState {
+    if disconnected {
+        return PreviewState::Failed(
+            "the background window feed stopped, so the list no longer updates".to_owned(),
+        );
+    }
+    if since_last_event >= PREVIEW_STALL_TIMEOUT {
+        return PreviewState::Failed(format!(
+            "no window snapshot arrived for {}s; window enumeration appears to be blocked",
+            since_last_event.as_secs()
+        ));
+    }
+    if has_snapshot {
+        return PreviewState::Ready;
+    }
+    match last_error {
+        Some(error) => PreviewState::Failed(error.to_owned()),
+        None => PreviewState::Waiting,
+    }
+}
+
 pub struct WindowFeed {
-    receiver: Receiver<WindowSnapshot>,
+    receiver: Receiver<FeedEvent>,
     latest: Option<WindowSnapshot>,
+    last_error: Option<String>,
+    disconnected: bool,
+    started: Instant,
+    last_event_at: Option<Instant>,
 }
 
 impl WindowFeed {
@@ -144,31 +211,88 @@ impl WindowFeed {
         thread::Builder::new()
             .name("rustnt-window-feed".to_owned())
             .spawn(move || loop {
-                if let Ok(snapshot) = enumerate_windows() {
-                    if sender.send(snapshot).is_err() {
-                        break;
-                    }
+                let event = match enumerate_windows() {
+                    Ok(snapshot) => FeedEvent::Snapshot(snapshot),
+                    Err(error) => FeedEvent::Failure(error.to_string()),
+                };
+                if sender.send(event).is_err() {
+                    break;
                 }
                 thread::sleep(PREVIEW_REFRESH_INTERVAL);
             })
             .expect("spawn window feed thread");
+        Self::from_receiver(receiver)
+    }
+
+    fn from_receiver(receiver: Receiver<FeedEvent>) -> Self {
         Self {
             receiver,
             latest: None,
+            last_error: None,
+            disconnected: false,
+            started: Instant::now(),
+            last_event_at: None,
         }
     }
 
     pub fn poll(&mut self) -> bool {
         let mut updated = false;
-        while let Ok(snapshot) = self.receiver.try_recv() {
-            self.latest = Some(snapshot);
-            updated = true;
+        loop {
+            match self.receiver.try_recv() {
+                Ok(FeedEvent::Snapshot(snapshot)) => {
+                    if self.latest.is_none() {
+                        let usable = collect_window_items(&snapshot, std::process::id()).len();
+                        eprintln!(
+                            "[rustnt-preview] first window snapshot: {} windows, {usable} listed",
+                            snapshot.windows.len()
+                        );
+                    }
+                    self.latest = Some(snapshot);
+                    self.last_error = None;
+                    self.last_event_at = Some(Instant::now());
+                    updated = true;
+                }
+                Ok(FeedEvent::Failure(message)) => {
+                    if self.last_error.as_deref() != Some(message.as_str()) {
+                        eprintln!("[rustnt-preview] window enumeration failed: {message}");
+                    }
+                    self.last_error = Some(message);
+                    self.last_event_at = Some(Instant::now());
+                    updated = true;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if !self.disconnected {
+                        eprintln!("[rustnt-preview] window feed stopped: sender disconnected");
+                    }
+                    self.disconnected = true;
+                    updated = true;
+                    break;
+                }
+            }
         }
         updated
     }
 
     pub fn latest(&self) -> Option<&WindowSnapshot> {
         self.latest.as_ref()
+    }
+
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
+    fn since_last_event(&self) -> Duration {
+        self.last_event_at.unwrap_or(self.started).elapsed()
+    }
+
+    pub fn state(&self) -> PreviewState {
+        preview_state(
+            self.latest.is_some(),
+            self.last_error.as_deref(),
+            self.disconnected,
+            self.since_last_event(),
+        )
     }
 }
 
@@ -256,9 +380,22 @@ impl eframe::App for DesktopPreviewApp {
                 ui.colored_label(egui::Color32::from_rgb(0xf0, 0xc0, 0x60), notice);
             }
 
+            let state = self.feed.state();
+            if let PreviewState::Failed(message) = &state {
+                ui.colored_label(
+                    egui::Color32::from_rgb(0xe0, 0x6c, 0x6c),
+                    format!("Window feed problem: {message}"),
+                );
+            } else if let Some(error) = self.feed.last_error() {
+                ui.colored_label(
+                    egui::Color32::from_rgb(0xf0, 0xc0, 0x60),
+                    format!("Last refresh failed: {error}"),
+                );
+            }
+
             egui::ScrollArea::vertical().show(ui, |ui| {
                 if items.is_empty() {
-                    ui.label("Waiting for the first window snapshot...");
+                    ui.label(empty_list_notice(&state));
                 }
                 for item in &items {
                     let prefix = if item.foreground { "> " } else { "  " };
@@ -414,6 +551,160 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(taskbar_items(&items).len(), MAX_TASKBAR_ITEMS);
         assert_eq!(taskbar_items(&items[..3]).len(), 3);
+    }
+
+    fn snapshot(titles: &[&str]) -> WindowSnapshot {
+        WindowSnapshot {
+            current_session_id: 1,
+            current_desktop: "Default".to_owned(),
+            windows: titles
+                .iter()
+                .map(|title| window("Notepad", title, 7, true))
+                .collect(),
+            skipped_windows: 0,
+        }
+    }
+
+    #[test]
+    fn waiting_is_only_reported_before_the_first_event() {
+        assert_eq!(
+            preview_state(false, None, false, Duration::from_millis(200)),
+            PreviewState::Waiting
+        );
+        assert_eq!(
+            empty_list_notice(&PreviewState::Waiting),
+            "Waiting for the first window snapshot..."
+        );
+    }
+
+    #[test]
+    fn first_snapshot_clears_the_waiting_state() {
+        let (sender, receiver) = mpsc::channel();
+        let mut feed = WindowFeed::from_receiver(receiver);
+        assert_eq!(feed.state(), PreviewState::Waiting);
+
+        sender
+            .send(FeedEvent::Snapshot(snapshot(&["alpha"])))
+            .unwrap();
+        assert!(feed.poll());
+
+        assert_eq!(feed.state(), PreviewState::Ready);
+        assert_eq!(feed.latest().map(|snap| snap.windows.len()), Some(1));
+    }
+
+    #[test]
+    fn an_empty_snapshot_is_ready_not_waiting() {
+        let (sender, receiver) = mpsc::channel();
+        let mut feed = WindowFeed::from_receiver(receiver);
+        sender.send(FeedEvent::Snapshot(snapshot(&[]))).unwrap();
+        feed.poll();
+
+        let state = feed.state();
+        assert_eq!(state, PreviewState::Ready);
+        assert_ne!(
+            empty_list_notice(&state),
+            empty_list_notice(&PreviewState::Waiting)
+        );
+        assert!(empty_list_notice(&state).contains("No application windows"));
+    }
+
+    #[test]
+    fn enumeration_failure_is_reported_instead_of_waiting() {
+        let (sender, receiver) = mpsc::channel();
+        let mut feed = WindowFeed::from_receiver(receiver);
+        sender
+            .send(FeedEvent::Failure("window enumeration: denied".to_owned()))
+            .unwrap();
+        feed.poll();
+
+        let state = feed.state();
+        assert!(matches!(state, PreviewState::Failed(_)));
+        assert!(empty_list_notice(&state).contains("denied"));
+        assert_eq!(feed.last_error(), Some("window enumeration: denied"));
+    }
+
+    #[test]
+    fn a_dropped_sender_is_reported_as_a_stopped_feed() {
+        let (sender, receiver) = mpsc::channel::<FeedEvent>();
+        let mut feed = WindowFeed::from_receiver(receiver);
+        sender
+            .send(FeedEvent::Snapshot(snapshot(&["alpha"])))
+            .unwrap();
+        feed.poll();
+        drop(sender);
+        feed.poll();
+
+        let state = feed.state();
+        assert!(matches!(state, PreviewState::Failed(_)));
+        assert!(empty_list_notice(&state).contains("no longer updates"));
+    }
+
+    #[test]
+    fn a_silent_feed_is_reported_as_blocked_after_the_stall_timeout() {
+        let state = preview_state(false, None, false, PREVIEW_STALL_TIMEOUT);
+        assert!(matches!(state, PreviewState::Failed(_)));
+        assert!(empty_list_notice(&state).contains("blocked"));
+    }
+
+    #[test]
+    fn refresh_replaces_the_previous_snapshot() {
+        let (sender, receiver) = mpsc::channel();
+        let mut feed = WindowFeed::from_receiver(receiver);
+        sender
+            .send(FeedEvent::Snapshot(snapshot(&["alpha", "beta"])))
+            .unwrap();
+        feed.poll();
+        assert_eq!(feed.latest().unwrap().windows.len(), 2);
+
+        sender
+            .send(FeedEvent::Snapshot(snapshot(&["gamma"])))
+            .unwrap();
+        feed.poll();
+
+        let latest = feed.latest().unwrap();
+        assert_eq!(latest.windows.len(), 1);
+        assert_eq!(latest.windows[0].title, "gamma");
+        assert_eq!(feed.state(), PreviewState::Ready);
+    }
+
+    #[test]
+    fn a_failure_after_a_successful_snapshot_keeps_the_last_snapshot() {
+        let (sender, receiver) = mpsc::channel();
+        let mut feed = WindowFeed::from_receiver(receiver);
+        sender
+            .send(FeedEvent::Snapshot(snapshot(&["alpha"])))
+            .unwrap();
+        feed.poll();
+        sender
+            .send(FeedEvent::Failure("temporary".to_owned()))
+            .unwrap();
+        feed.poll();
+
+        assert_eq!(feed.state(), PreviewState::Ready);
+        assert_eq!(feed.last_error(), Some("temporary"));
+        assert_eq!(feed.latest().unwrap().windows.len(), 1);
+    }
+
+    #[test]
+    fn spawned_feed_delivers_a_snapshot() {
+        let mut feed = WindowFeed::spawn();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline && feed.latest().is_none() {
+            feed.poll();
+            thread::sleep(Duration::from_millis(50));
+        }
+        let snapshot = feed.latest().expect("feed must deliver a snapshot");
+        let items = collect_window_items(snapshot, std::process::id());
+        println!(
+            "snapshot windows={} skipped={} items={}",
+            snapshot.windows.len(),
+            snapshot.skipped_windows,
+            items.len()
+        );
+        assert!(
+            !snapshot.windows.is_empty(),
+            "enumeration returned no windows"
+        );
     }
 
     #[test]

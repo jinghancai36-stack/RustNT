@@ -238,7 +238,29 @@ fn thread_desktop_name(thread_id: u32) -> Option<String> {
     desktop_name(desktop.cast()).ok()
 }
 
-fn read_window_text(hwnd: HWND) -> String {
+/// May a window-text query send window messages for this window?
+///
+/// `GetWindowTextLengthW`/`GetWindowTextW` are message-free for windows owned by
+/// another process, but they synchronously send `WM_GETTEXTLENGTH`/`WM_GETTEXT`
+/// to a window owned by the current process. A thread of this process that does
+/// not pump messages (a GPU device thread, for example) will therefore never
+/// answer, and the caller blocks forever. Only same-thread windows are safe to
+/// query, because `SendMessage` to the calling thread calls the window procedure
+/// directly instead of waiting for a message loop.
+fn may_send_window_messages(
+    window_pid: u32,
+    window_thread_id: u32,
+    current_pid: u32,
+    current_thread_id: u32,
+) -> bool {
+    window_pid != current_pid || window_thread_id == current_thread_id
+}
+
+fn read_window_text(hwnd: HWND, messages_allowed: bool) -> String {
+    if !messages_allowed {
+        return String::new();
+    }
+
     let length = unsafe {
         // SAFETY: hwnd comes from EnumWindows or a foreground-window query.
         GetWindowTextLengthW(hwnd)
@@ -333,10 +355,23 @@ fn collect_window(
         return Err(WindowCollection::Filtered);
     }
 
+    let messages_allowed = may_send_window_messages(
+        pid,
+        thread_id,
+        unsafe {
+            // SAFETY: GetCurrentProcessId has no preconditions.
+            GetCurrentProcessId()
+        },
+        unsafe {
+            // SAFETY: GetCurrentThreadId has no preconditions.
+            GetCurrentThreadId()
+        },
+    );
+
     let metadata = process_metadata(processes, pid);
     Ok(Some(WindowInfo {
         hwnd: hwnd as usize,
-        title: read_window_text(hwnd),
+        title: read_window_text(hwnd, messages_allowed),
         class_name: read_class_name(hwnd),
         pid,
         process_name: metadata.name.map(str::to_string),
@@ -669,9 +704,19 @@ pub fn activate_window(hwnd: usize) -> Result<ActivationOutcome, WindowError> {
 mod tests {
     use super::{
         activation_precheck, enumerate_windows, foreground_window, format_hwnd, list_sessions,
-        map_session_state, optional_text, wide_string, wide_string_from_ptr, ActivationRejection,
-        SessionState,
+        map_session_state, may_send_window_messages, optional_text, wide_string,
+        wide_string_from_ptr, ActivationRejection, SessionState,
     };
+
+    #[test]
+    fn window_text_messages_are_only_sent_when_they_cannot_deadlock() {
+        // Another process: message-free API path.
+        assert!(may_send_window_messages(1200, 77, 42, 9));
+        // Same process, same thread: SendMessage calls the window procedure directly.
+        assert!(may_send_window_messages(42, 9, 42, 9));
+        // Same process, other thread: the owner may have no message loop.
+        assert!(!may_send_window_messages(42, 77, 42, 9));
+    }
 
     #[test]
     fn session_state_mapping_preserves_known_and_unknown_values() {
