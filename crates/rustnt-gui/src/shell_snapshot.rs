@@ -313,6 +313,19 @@ impl fmt::Display for SnapshotError {
 impl std::error::Error for SnapshotError {}
 
 pub fn save_snapshot(paths: &ConfigPaths, snapshot: &ShellSnapshot) -> Result<(), SnapshotError> {
+    save_snapshot_with_replacer(paths, snapshot, replace_snapshot_file)
+}
+
+/// Private write chain with an injectable replacement step.
+///
+/// Production always passes `replace_snapshot_file`. The seam exists solely so
+/// that deterministic fault-injection tests in this file can simulate Win32
+/// failure states without touching the real API or relying on random 1175.
+fn save_snapshot_with_replacer(
+    paths: &ConfigPaths,
+    snapshot: &ShellSnapshot,
+    replacer: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(), SnapshotError> {
     if snapshot.format_version != FORMAT_VERSION {
         return Err(SnapshotError::new(
             "validate snapshot",
@@ -334,11 +347,180 @@ pub fn save_snapshot(paths: &ConfigPaths, snapshot: &ShellSnapshot) -> Result<()
     }
     let temporary = write_temporary_snapshot(&paths.shell_snapshot_file, &encoded)
         .map_err(|error| SnapshotError::new("write temporary snapshot", error))?;
-    if let Err(error) = replace_snapshot_file(&temporary, &paths.shell_snapshot_file) {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(SnapshotError::new("replace snapshot", error));
+    let target = &paths.shell_snapshot_file;
+    if let Err(error) = replacer(&temporary, target) {
+        // State-aware cleanup: keep the temporary file unless removing it is
+        // proven to lose no data. Never turn a failed replace into success.
+        let assessment = observe_failure_state(target, &temporary, &encoded);
+        let decision = decide_cleanup(&assessment);
+        if decision == CleanupDecision::Remove {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        return Err(replace_snapshot_error(
+            target,
+            &temporary,
+            &error,
+            &assessment,
+            decision,
+        ));
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArtifactState {
+    Missing,
+    Complete,
+    Incomplete,
+    Unverifiable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CleanupDecision {
+    Keep(&'static str),
+    Remove,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FailureAssessment {
+    target: ArtifactState,
+    temporary: ArtifactState,
+    identical_bytes: bool,
+}
+
+fn decide_cleanup(assessment: &FailureAssessment) -> CleanupDecision {
+    if assessment.target == ArtifactState::Missing {
+        return CleanupDecision::Keep("target is missing; temporary may be the only complete copy");
+    }
+    if assessment.target == ArtifactState::Unverifiable
+        || assessment.temporary == ArtifactState::Unverifiable
+    {
+        return CleanupDecision::Keep("file state cannot be verified reliably");
+    }
+    if assessment.target == ArtifactState::Incomplete
+        || assessment.temporary == ArtifactState::Incomplete
+    {
+        return CleanupDecision::Keep("an artifact is not verifiably complete");
+    }
+    if assessment.identical_bytes {
+        // The only proven-safe removal: both files hold identical complete
+        // bytes, so deleting the temporary copy loses no data at all.
+        return CleanupDecision::Remove;
+    }
+    // Default is conservative: preserve complete artifacts for diagnostics.
+    CleanupDecision::Keep("complete artifacts are preserved for diagnostics")
+}
+
+fn observe_failure_state(target: &Path, temporary: &Path, encoded: &str) -> FailureAssessment {
+    let (target_state, target_bytes) = observe_artifact(target, None);
+    let (temporary_state, temporary_bytes) = observe_artifact(temporary, Some(encoded.as_bytes()));
+    let identical_bytes = match (target_bytes, temporary_bytes) {
+        (Some(target_bytes), Some(temporary_bytes)) => target_bytes == temporary_bytes,
+        _ => false,
+    };
+    FailureAssessment {
+        target: target_state,
+        temporary: temporary_state,
+        identical_bytes,
+    }
+}
+
+/// Presence is decided from metadata plus a directory enumeration, NEVER from a
+/// single failed `fs::read`: an exclusive external handle can make a read fail
+/// while the file still exists (Task 01B.5C-B Gate A observation-bias finding).
+fn observe_artifact(path: &Path, expected: Option<&[u8]>) -> (ArtifactState, Option<Vec<u8>>) {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return match directory_contains(path) {
+                Some(false) => (ArtifactState::Missing, None),
+                // Directory listing disagrees with metadata, or cannot be read:
+                // treat the state as unverifiable rather than "missing".
+                _ => (ArtifactState::Unverifiable, None),
+            };
+        }
+        Err(_) => return (ArtifactState::Unverifiable, None),
+    }
+    match read_artifact_bytes(path) {
+        Ok(bytes) => {
+            let complete = match expected {
+                Some(expected_bytes) => bytes == expected_bytes,
+                None => is_valid_snapshot_bytes(&bytes),
+            };
+            let state = if complete {
+                ArtifactState::Complete
+            } else {
+                ArtifactState::Incomplete
+            };
+            (state, Some(bytes))
+        }
+        // A failed read means the state is unverifiable, NOT that the file is gone.
+        Err(_) => (ArtifactState::Unverifiable, None),
+    }
+}
+
+fn directory_contains(path: &Path) -> Option<bool> {
+    let parent = path.parent()?;
+    let name = path.file_name()?;
+    let entries = std::fs::read_dir(parent).ok()?;
+    for entry in entries.flatten() {
+        if entry.file_name().as_os_str() == name {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+fn read_artifact_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity(MAX_SNAPSHOT_BYTES + 1);
+    file.take((MAX_SNAPSHOT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn is_valid_snapshot_bytes(bytes: &[u8]) -> bool {
+    if bytes.len() > MAX_SNAPSHOT_BYTES {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(text) else {
+        return false;
+    };
+    value
+        .get("format_version")
+        .and_then(toml::Value::as_integer)
+        == Some(i64::from(FORMAT_VERSION))
+}
+
+fn replace_snapshot_error(
+    target: &Path,
+    temporary: &Path,
+    error: &std::io::Error,
+    assessment: &FailureAssessment,
+    decision: CleanupDecision,
+) -> SnapshotError {
+    let win32 = error
+        .raw_os_error()
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let cleanup = match decision {
+        CleanupDecision::Remove => "removed (proven byte-identical, no data loss)".to_owned(),
+        CleanupDecision::Keep(reason) => format!("preserved ({reason})"),
+    };
+    SnapshotError::new(
+        "replace snapshot",
+        format!(
+            "MoveFileExW replacement failed (Windows error {win32}: {error}); \
+             target={}; temporary={}; target_state={:?}; temporary_state={:?}; cleanup={cleanup}",
+            target.display(),
+            temporary.display(),
+            assessment.target,
+            assessment.temporary
+        ),
+    )
 }
 
 pub fn load_snapshot(paths: &ConfigPaths) -> Result<Option<ShellSnapshot>, SnapshotError> {
@@ -419,9 +601,15 @@ fn write_temporary_snapshot(target: &Path, encoded: &str) -> std::io::Result<Pat
             Err(error) => return Err(error),
         };
         if let Err(error) = file.write_all(encoded.as_bytes()) {
+            // Close the handle before removing this provably incomplete artifact.
+            drop(file);
             let _ = std::fs::remove_file(&temporary);
             return Err(error);
         }
+        // Explicitly close the temporary file handle BEFORE the caller replaces
+        // the target. No flush(), sync_all() or MOVEFILE_WRITE_THROUGH is
+        // introduced here: the pre-fix durability semantics are preserved.
+        drop(file);
         return Ok(temporary);
     }
     Err(std::io::Error::new(
@@ -432,24 +620,14 @@ fn write_temporary_snapshot(target: &Path, encoded: &str) -> std::io::Result<Pat
 
 #[cfg(not(windows))]
 fn replace_snapshot_file(temporary: &Path, target: &Path) -> std::io::Result<()> {
+    // Non-Windows fallback: a single rename, with no `exists()` decision gate.
     std::fs::rename(temporary, target)
 }
 
 #[cfg(windows)]
 fn replace_snapshot_file(temporary: &Path, target: &Path) -> std::io::Result<()> {
-    if !target.exists() {
-        return match std::fs::rename(temporary, target) {
-            Ok(()) => Ok(()),
-            Err(_error) if target.exists() => replace_existing_snapshot(temporary, target),
-            Err(error) => Err(error),
-        };
-    }
-    replace_existing_snapshot(temporary, target)
-}
-
-#[cfg(windows)]
-fn replace_existing_snapshot(temporary: &Path, target: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
 
     let target_wide = target
         .as_os_str()
@@ -461,17 +639,19 @@ fn replace_existing_snapshot(temporary: &Path, target: &Path) -> std::io::Result
         .encode_wide()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
-    let replaced = unsafe {
-        windows_sys::Win32::Storage::FileSystem::ReplaceFileW(
-            target_wide.as_ptr(),
+    // One call handles BOTH target-present (atomic replace) and target-absent
+    // (atomic rename). No `exists()` gate, no pre-delete of the target, no
+    // backup file, no MOVEFILE_COPY_ALLOWED (temporary and target share a
+    // directory/volume). 1175/1176/1177 are legacy ReplaceFileW partial-failure
+    // codes; MoveFileExW has no documented equivalents.
+    let moved = unsafe {
+        MoveFileExW(
             temporary_wide.as_ptr(),
-            std::ptr::null(),
-            0,
-            std::ptr::null(),
-            std::ptr::null(),
+            target_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING,
         )
     };
-    if replaced == 0 {
+    if moved == 0 {
         Err(std::io::Error::last_os_error())
     } else {
         Ok(())
@@ -959,5 +1139,538 @@ mod tests {
         assert!(serialized.contains("result"));
         assert!(serialized.contains("character_count"));
         assert!(serialized.contains("digest"));
+    }
+
+    // =====================================================================
+    // Task 01B.5C-B Gate B — deterministic fault-injection regression suite.
+    //
+    // Three evidence classes are kept strictly separate:
+    //   * real MoveFileExW failure   -> `gate_b_real_*` / released-handle tests
+    //                                  (no injection at all)
+    //   * simulated error state      -> `failing_replacer(...)` closures
+    //   * legacy ReplaceFileW codes  -> 1175/1176/1177 are SIMULATED legacy
+    //     partial-failure states, never normal MoveFileExW production errors.
+    // No Mutex, no retry, no second protocol, no new on-disk format.
+    // =====================================================================
+
+    #[derive(Clone, Copy)]
+    enum InjectedLayout {
+        LeaveIntact,
+        RemoveTarget,
+        RenameTarget,
+    }
+
+    /// Private, deterministic replacement-step injector: it puts the disk into
+    /// a chosen documented failure state, then returns a chosen Win32 code.
+    fn failing_replacer(
+        code: i32,
+        layout: InjectedLayout,
+    ) -> impl Fn(&Path, &Path) -> std::io::Result<()> {
+        move |_temporary, target| {
+            match layout {
+                InjectedLayout::LeaveIntact => {}
+                InjectedLayout::RemoveTarget => {
+                    let _ = std::fs::remove_file(target);
+                }
+                InjectedLayout::RenameTarget => {
+                    let renamed = target.with_extension("renamed");
+                    let _ = std::fs::remove_file(&renamed);
+                    let _ = std::fs::rename(target, &renamed);
+                }
+            }
+            Err(std::io::Error::from_raw_os_error(code))
+        }
+    }
+
+    fn encoded_snapshot(snapshot: &ShellSnapshot) -> String {
+        toml::to_string_pretty(snapshot).expect("fixture must serialize")
+    }
+
+    fn temporary_files(root: &Path) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("shell_snapshot.toml.") && name.ends_with(".tmp")
+            })
+            .map(|entry| entry.path())
+            .collect()
+    }
+
+    fn assert_error_context(error: &SnapshotError, paths: &ConfigPaths, code: i32) {
+        assert_eq!(error.operation, "replace snapshot");
+        assert!(error.message.contains("MoveFileExW replacement failed"));
+        assert!(error.message.contains(&format!("Windows error {code}")));
+        assert!(error
+            .message
+            .contains(&paths.shell_snapshot_file.to_string_lossy().to_string()));
+        assert!(error.message.contains("temporary="));
+        assert!(error.message.contains("cleanup="));
+    }
+
+    fn second_snapshot() -> ShellSnapshot {
+        let mut snapshot = fixture_snapshot();
+        snapshot.process_id = 5678;
+        snapshot.captured_at_unix_seconds = 1_700_000_999;
+        snapshot
+    }
+
+    #[cfg(windows)]
+    fn open_exclusive_handle(path: &Path) -> windows_sys::Win32::Foundation::HANDLE {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING,
+        };
+
+        let wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        // share mode 0 = exclusive; a replacement cannot proceed and reads
+        // through std::fs::File::open will fail while the handle is held.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(handle, INVALID_HANDLE_VALUE, "CreateFileW must open target");
+        handle
+    }
+
+    #[cfg(windows)]
+    fn close_exclusive_handle(handle: windows_sys::Win32::Foundation::HANDLE) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        unsafe {
+            CloseHandle(handle);
+        }
+    }
+
+    #[test]
+    fn gate_b_first_creation_creates_target_with_single_move() {
+        let root = TestRoot::new("gb-first-create");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let snapshot = fixture_snapshot();
+        assert!(!paths.shell_snapshot_file.exists());
+        save_snapshot(&paths, &snapshot).unwrap();
+        assert_eq!(load_snapshot(&paths).unwrap().unwrap(), snapshot);
+        assert!(temporary_files(root.path()).is_empty());
+    }
+
+    #[test]
+    fn gate_b_replace_existing_is_atomic() {
+        let root = TestRoot::new("gb-replace");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let first = fixture_snapshot();
+        let second = second_snapshot();
+        save_snapshot(&paths, &first).unwrap();
+        assert_eq!(load_snapshot(&paths).unwrap().unwrap(), first);
+        let first_bytes = std::fs::read(&paths.shell_snapshot_file).unwrap();
+        save_snapshot(&paths, &second).unwrap();
+        let second_bytes = std::fs::read(&paths.shell_snapshot_file).unwrap();
+        assert_ne!(first_bytes, second_bytes);
+        assert_eq!(load_snapshot(&paths).unwrap().unwrap(), second);
+        assert_eq!(
+            second_bytes.as_slice(),
+            encoded_snapshot(&second).as_bytes()
+        );
+        assert!(temporary_files(root.path()).is_empty());
+    }
+
+    #[test]
+    fn gate_b_temporary_handle_is_released_before_replacement() {
+        let root = TestRoot::new("gb-handle");
+        std::fs::create_dir_all(root.path()).unwrap();
+        let target = root.path().join("shell_snapshot.toml");
+        let encoded = encoded_snapshot(&fixture_snapshot());
+        let temporary = write_temporary_snapshot(&target, &encoded).unwrap();
+        // A real replacement succeeds only if write_temporary_snapshot has
+        // explicitly closed the temporary file handle before returning.
+        replace_snapshot_file(&temporary, &target).unwrap();
+        assert!(!temporary.exists());
+        assert_eq!(
+            std::fs::read(&target).unwrap().as_slice(),
+            encoded.as_bytes()
+        );
+    }
+
+    #[test]
+    fn gate_b_old_target_bytes_remain_intact_after_failed_replace() {
+        let root = TestRoot::new("gb-old-intact");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let first = fixture_snapshot();
+        let second = second_snapshot();
+        save_snapshot(&paths, &first).unwrap();
+        let original = std::fs::read(&paths.shell_snapshot_file).unwrap();
+        let error = save_snapshot_with_replacer(
+            &paths,
+            &second,
+            failing_replacer(32, InjectedLayout::LeaveIntact),
+        )
+        .expect_err("injected failure must be reported");
+        assert_eq!(std::fs::read(&paths.shell_snapshot_file).unwrap(), original);
+        assert_eq!(load_snapshot(&paths).unwrap().unwrap(), first);
+        assert_error_context(&error, &paths, 32);
+    }
+
+    #[test]
+    fn gate_b_new_temporary_bytes_remain_complete_after_failed_replace() {
+        let root = TestRoot::new("gb-new-complete");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let second = second_snapshot();
+        save_snapshot(&paths, &fixture_snapshot()).unwrap();
+        save_snapshot_with_replacer(
+            &paths,
+            &second,
+            failing_replacer(5, InjectedLayout::LeaveIntact),
+        )
+        .expect_err("injected failure must be reported");
+        let temps = temporary_files(root.path());
+        assert_eq!(
+            temps.len(),
+            1,
+            "exactly one complete temporary artifact must be preserved"
+        );
+        assert_eq!(
+            std::fs::read(&temps[0]).unwrap().as_slice(),
+            encoded_snapshot(&second).as_bytes()
+        );
+    }
+
+    #[test]
+    fn gate_b_replace_failure_propagates_error_to_caller() {
+        let root = TestRoot::new("gb-propagate");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let snapshot = fixture_snapshot();
+        let error = save_snapshot_with_replacer(
+            &paths,
+            &snapshot,
+            failing_replacer(32, InjectedLayout::LeaveIntact),
+        )
+        .expect_err("replacement failure must propagate as Err");
+        assert_eq!(error.operation, "replace snapshot");
+        assert_error_context(&error, &paths, 32);
+    }
+
+    #[test]
+    fn gate_b_replace_failure_never_returns_ok() {
+        for code in [32, 5, 1175, 1176, 1177] {
+            let root = TestRoot::new(&format!("gb-never-ok-{code}"));
+            let paths = config_paths_from_root(root.path().to_owned());
+            let snapshot = fixture_snapshot();
+            save_snapshot(&paths, &snapshot).unwrap();
+            let result = save_snapshot_with_replacer(
+                &paths,
+                &snapshot,
+                failing_replacer(code, InjectedLayout::LeaveIntact),
+            );
+            assert!(
+                result.is_err(),
+                "simulated Win32 code {code} must not be silently swallowed"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_b_target_missing_keeps_only_complete_temporary() {
+        let root = TestRoot::new("gb-target-missing");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let snapshot = fixture_snapshot();
+        save_snapshot(&paths, &snapshot).unwrap();
+        // Simulated 1176 terminal state: the replaced file no longer exists.
+        let error = save_snapshot_with_replacer(
+            &paths,
+            &snapshot,
+            failing_replacer(1176, InjectedLayout::RemoveTarget),
+        )
+        .expect_err("injected 1176 must fail");
+        assert!(!paths.shell_snapshot_file.exists());
+        let temps = temporary_files(root.path());
+        assert_eq!(temps.len(), 1, "the only complete copy must survive");
+        assert_eq!(
+            std::fs::read(&temps[0]).unwrap().as_slice(),
+            encoded_snapshot(&snapshot).as_bytes()
+        );
+        assert!(error.message.contains("target is missing"));
+        assert!(error.message.contains("preserved"));
+        assert_error_context(&error, &paths, 1176);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn gate_b_unverifiable_state_keeps_temporary_and_is_not_missing() {
+        let root = TestRoot::new("gb-unverifiable");
+        std::fs::create_dir_all(root.path()).unwrap();
+        let target = root.path().join("shell_snapshot.toml");
+        std::fs::write(&target, "format_version = 1\n").unwrap();
+        let handle = open_exclusive_handle(&target);
+        // A single failed read under an exclusive handle must NOT be
+        // interpreted as "file missing" (Gate A observation-bias finding).
+        let (state, bytes) = observe_artifact(&target, None);
+        assert_eq!(state, ArtifactState::Unverifiable);
+        assert!(bytes.is_none());
+        assert_eq!(directory_contains(&target), Some(true));
+        close_exclusive_handle(handle);
+        let assessment = FailureAssessment {
+            target: ArtifactState::Unverifiable,
+            temporary: ArtifactState::Complete,
+            identical_bytes: false,
+        };
+        assert!(matches!(
+            decide_cleanup(&assessment),
+            CleanupDecision::Keep(_)
+        ));
+    }
+
+    #[test]
+    fn gate_b_injected_error_32_has_paths_and_win32_code() {
+        let root = TestRoot::new("gb-injected-32");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let snapshot = fixture_snapshot();
+        let error = save_snapshot_with_replacer(
+            &paths,
+            &snapshot,
+            failing_replacer(32, InjectedLayout::LeaveIntact),
+        )
+        .expect_err("injected ERROR_SHARING_VIOLATION must fail");
+        assert_error_context(&error, &paths, 32);
+    }
+
+    #[test]
+    fn gate_b_injected_error_5_has_paths_and_win32_code() {
+        let root = TestRoot::new("gb-injected-5");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let snapshot = fixture_snapshot();
+        let error = save_snapshot_with_replacer(
+            &paths,
+            &snapshot,
+            failing_replacer(5, InjectedLayout::LeaveIntact),
+        )
+        .expect_err("injected ERROR_ACCESS_DENIED must fail");
+        assert_error_context(&error, &paths, 5);
+    }
+
+    #[test]
+    fn gate_b_simulated_legacy_1175_keeps_both_artifacts() {
+        // 1175 is a legacy ReplaceFileW ERROR_UNABLE_TO_REMOVE_REPLACED:
+        // both files keep their original names and both are complete.
+        let root = TestRoot::new("gb-legacy-1175");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let first = fixture_snapshot();
+        let second = second_snapshot();
+        save_snapshot(&paths, &first).unwrap();
+        let original = std::fs::read(&paths.shell_snapshot_file).unwrap();
+        let error = save_snapshot_with_replacer(
+            &paths,
+            &second,
+            failing_replacer(1175, InjectedLayout::LeaveIntact),
+        )
+        .expect_err("simulated legacy 1175 must fail");
+        assert_eq!(std::fs::read(&paths.shell_snapshot_file).unwrap(), original);
+        let temps = temporary_files(root.path());
+        assert_eq!(temps.len(), 1);
+        assert_eq!(
+            std::fs::read(&temps[0]).unwrap().as_slice(),
+            encoded_snapshot(&second).as_bytes()
+        );
+        assert_error_context(&error, &paths, 1175);
+    }
+
+    #[test]
+    fn gate_b_simulated_legacy_1177_keeps_temporary() {
+        // 1177 is a legacy ReplaceFileW ERROR_UNABLE_TO_MOVE_REPLACEMENT_2:
+        // the replaced file survives under a different, unknown name.
+        let root = TestRoot::new("gb-legacy-1177");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let second = second_snapshot();
+        save_snapshot(&paths, &fixture_snapshot()).unwrap();
+        let error = save_snapshot_with_replacer(
+            &paths,
+            &second,
+            failing_replacer(1177, InjectedLayout::RenameTarget),
+        )
+        .expect_err("simulated legacy 1177 must fail");
+        assert!(!paths.shell_snapshot_file.exists());
+        assert!(root.path().join("shell_snapshot.renamed").exists());
+        let temps = temporary_files(root.path());
+        assert_eq!(temps.len(), 1);
+        assert_eq!(
+            std::fs::read(&temps[0]).unwrap().as_slice(),
+            encoded_snapshot(&second).as_bytes()
+        );
+        assert_error_context(&error, &paths, 1177);
+    }
+
+    #[test]
+    fn gate_b_toml_v1_round_trip_is_unchanged() {
+        let root = TestRoot::new("gb-toml-v1");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let snapshot = fixture_snapshot();
+        save_snapshot(&paths, &snapshot).unwrap();
+        let text = std::fs::read_to_string(&paths.shell_snapshot_file).unwrap();
+        assert_eq!(FORMAT_VERSION, 1);
+        assert!(text.contains("format_version = 1"));
+        for field in [
+            "captured_at_unix_seconds",
+            "process_id",
+            "entries",
+            "target",
+            "value_type",
+            "result",
+            "character_count",
+            "digest",
+        ] {
+            assert!(text.contains(field), "missing TOML v1 field {field}");
+        }
+        assert_eq!(load_snapshot(&paths).unwrap().unwrap(), snapshot);
+    }
+
+    #[test]
+    fn gate_b_snapshot_failure_is_error_not_fatal_or_success() {
+        // main.rs:191-207 is intentionally unchanged: an Err is downgraded to
+        // a Warning notice (shell_recovery.rs:162-168), never propagated with
+        // `?` and never a panic. This asserts the contract that enables it.
+        let root = TestRoot::new("gb-not-fatal");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let error = save_snapshot_with_replacer(
+            &paths,
+            &fixture_snapshot(),
+            failing_replacer(5, InjectedLayout::LeaveIntact),
+        )
+        .expect_err("failure must be returned, not swallowed");
+        let _: &dyn std::error::Error = &error;
+        assert_eq!(error.operation, "replace snapshot");
+        assert!(!error.message.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn gate_b_real_exclusive_handle_conflict_keeps_temporary() {
+        // REAL MoveFileExW failure: no injection. An external exclusive handle
+        // makes the replacement fail with a genuine Win32 error.
+        let root = TestRoot::new("gb-real-handle");
+        let paths = config_paths_from_root(root.path().to_owned());
+        save_snapshot(&paths, &fixture_snapshot()).unwrap();
+        let handle = open_exclusive_handle(&paths.shell_snapshot_file);
+        let error = save_snapshot(&paths, &second_snapshot())
+            .expect_err("real MoveFileExW failure with an exclusive external handle");
+        close_exclusive_handle(handle);
+        // Emitted so host/VM validation scripts can record the real Win32 code,
+        // both paths, file states and the cleanup decision.
+        eprintln!("[gate-b-real-conflict] {}", error.message);
+        assert_eq!(error.operation, "replace snapshot");
+        assert!(error.message.contains("MoveFileExW replacement failed"));
+        assert!(error
+            .message
+            .contains(&paths.shell_snapshot_file.to_string_lossy().to_string()));
+        assert!(
+            !temporary_files(root.path()).is_empty(),
+            "the complete temporary artifact must be preserved on a real failure"
+        );
+    }
+
+    #[test]
+    fn gate_b_cleanup_decision_matrix_is_conservative() {
+        let cases = [
+            (
+                ArtifactState::Missing,
+                ArtifactState::Complete,
+                false,
+                false,
+            ),
+            (
+                ArtifactState::Unverifiable,
+                ArtifactState::Complete,
+                false,
+                false,
+            ),
+            (
+                ArtifactState::Complete,
+                ArtifactState::Unverifiable,
+                false,
+                false,
+            ),
+            (
+                ArtifactState::Incomplete,
+                ArtifactState::Complete,
+                false,
+                false,
+            ),
+            (
+                ArtifactState::Complete,
+                ArtifactState::Incomplete,
+                false,
+                false,
+            ),
+            (
+                ArtifactState::Complete,
+                ArtifactState::Complete,
+                false,
+                false,
+            ),
+            // Only proven byte-identical complete copies may be removed.
+            (ArtifactState::Complete, ArtifactState::Complete, true, true),
+        ];
+        for (target, temporary, identical_bytes, removable) in cases {
+            let assessment = FailureAssessment {
+                target,
+                temporary,
+                identical_bytes,
+            };
+            let decision = decide_cleanup(&assessment);
+            assert_eq!(
+                decision == CleanupDecision::Remove,
+                removable,
+                "unexpected cleanup decision for {assessment:?}: {decision:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_b_proven_redundant_artifacts_are_removed() {
+        // The narrow, provably safe removal: saving the very same snapshot
+        // twice makes target and temporary byte-identical.
+        let root = TestRoot::new("gb-redundant");
+        let paths = config_paths_from_root(root.path().to_owned());
+        let snapshot = fixture_snapshot();
+        save_snapshot(&paths, &snapshot).unwrap();
+        let original = std::fs::read(&paths.shell_snapshot_file).unwrap();
+        let error = save_snapshot_with_replacer(
+            &paths,
+            &snapshot,
+            failing_replacer(32, InjectedLayout::LeaveIntact),
+        )
+        .expect_err("injected failure must be reported");
+        assert!(error.message.contains("removed (proven byte-identical"));
+        assert!(temporary_files(root.path()).is_empty());
+        assert_eq!(std::fs::read(&paths.shell_snapshot_file).unwrap(), original);
+    }
+
+    #[test]
+    fn gate_b_create_and_replace_loop_leaves_no_residue() {
+        // First creation followed by 50 atomic replacements on the same target.
+        let root = TestRoot::new("gb-create-replace-loop");
+        let paths = config_paths_from_root(root.path().to_owned());
+        for iteration in 0..50_u32 {
+            let mut snapshot = fixture_snapshot();
+            snapshot.process_id = 1000 + iteration;
+            save_snapshot(&paths, &snapshot).unwrap();
+            assert_eq!(load_snapshot(&paths).unwrap().unwrap(), snapshot);
+            assert!(
+                temporary_files(root.path()).is_empty(),
+                "temporary residue at iteration {iteration}"
+            );
+        }
     }
 }
