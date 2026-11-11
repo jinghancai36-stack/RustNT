@@ -11,9 +11,11 @@ use crate::navigation::{
 use crate::notifications::{NotificationCenter, NotificationKind};
 use crate::recovery::RecoveryState;
 use crate::shell_recovery::StartupNotice;
+use crate::taskbar_viewport::{TaskbarViewportController, OPEN_BUTTON_LABEL};
 
 const RECOVERY_NOTICE: &str = "Previous run did not exit normally. Safe defaults are active.";
 const UNCONNECTED_DATA_SOURCE: &str = "Data source is not connected yet.";
+const TASKBAR_VIEWPORT_RUN_MODE: &str = "standard GUI (B1 experimental viewport)";
 
 pub type SharedConfig = Arc<Mutex<GuiConfig>>;
 
@@ -26,6 +28,7 @@ pub struct RustNtApp {
     pub(crate) navigation: NavigationState,
     pub(crate) notifications: NotificationCenter,
     pub(crate) file_browser: FileBrowserState,
+    pub(crate) taskbar_viewport: Arc<TaskbarViewportController>,
     notifications_open: bool,
     file_browser_path_input: String,
 }
@@ -62,6 +65,7 @@ impl RustNtApp {
             navigation: NavigationState::default(),
             notifications,
             file_browser,
+            taskbar_viewport: Arc::new(TaskbarViewportController::new(TASKBAR_VIEWPORT_RUN_MODE)),
             notifications_open: false,
             file_browser_path_input,
         }
@@ -272,6 +276,11 @@ impl RustNtApp {
                 ui.separator();
                 ui.label(format!("GUI: {}", recovery_label(self.recovery)));
                 ui.label(format!("Theme: {}", theme_label(theme)));
+                if ui.button(OPEN_BUTTON_LABEL).clicked() {
+                    self.taskbar_viewport.request_open();
+                }
+                ui.label(self.taskbar_viewport.state().notice);
+                ui.separator();
                 if ui
                     .button(format!(
                         "Notifications ({})",
@@ -551,6 +560,11 @@ impl eframe::App for RustNtApp {
         self.show_central_panel(ui, &ctx, theme);
         self.show_switcher(&ctx);
         self.show_notifications(&ctx);
+        self.taskbar_viewport.show_if_open(&ctx);
+    }
+
+    fn on_exit(&mut self) {
+        self.taskbar_viewport.shutdown_for_app_exit();
     }
 }
 

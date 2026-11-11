@@ -9,6 +9,7 @@ pub mod notifications;
 pub mod recovery;
 pub mod shell_recovery;
 pub mod shell_snapshot;
+pub mod taskbar_viewport;
 pub mod window_events;
 
 use std::fmt;
